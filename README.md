@@ -23,6 +23,9 @@ audio .wav → convert to 16 kHz mono 16-bit PCM → WebSocket to Azure Speech
 - **Per-phrase LLM analysis**: intent classification (closed list), per-phrase
   sentiment (`positive` / `neutral` / `negative`, evaluated on the latest phrase
   only) and a cumulative conversation summary.
+- **Editable intent taxonomy**: intents and their descriptions live in `intents.csv`,
+  loaded at startup and injected into the prompt to improve classification — no code
+  changes needed to add, remove or refine intents.
 - **Single combined call** when intent and summary share the same endpoint/model,
   or **two parallel calls** (`ThreadPoolExecutor`) when they differ. Intent and
   sentiment are both per-phrase and always run on the **intent** model/endpoint;
@@ -96,8 +99,20 @@ flowchart TD
 | `stt-speech-ws-llm-secs.py` | WebSocket CLI variant with **exact fixed-time segments**: optionally slices the audio client-side into precise N-second windows (`--interval`), one recognition turn per segment over a single connection. Without the flag it behaves like `stt-speech-ws-llm.py`. |
 | `stt-speech-llm.py` | CLI client using the **Azure Speech SDK** (`PushAudioInputStream`) with Entra ID auth and Semantic segmentation. |
 | `stt-speech-ws-llm_app.py` | **Streamlit** web UI. The pipeline runs in a dedicated background thread; the UI only reads results from a thread-safe queue. |
-| `stt-speech-ws-llm (con/sin conversión de audio).py` | Experimental variants (with / without audio conversion). |
+| `intents.csv` | Editable intent taxonomy (`intent,description` columns) loaded at startup and injected into the LLM prompt. |
 | `customer-support-sample.wav` | Default sample audio file. |
+
+---
+
+## Python scripts
+
+| Script | Transport | What it does |
+| --- | --- | --- |
+| `common_functions.py` | — | **Shared library imported by every script.** Holds all configuration constants, audio conversion to 16 kHz mono 16-bit PCM, Azure OpenAI client creation / warm-up / `analyze_phrase`, Speech Entra ID authentication, WebSocket protocol message builders, intent loading from `intents.csv` and the CSV results writer. Not meant to be run directly. |
+| `stt-speech-ws-llm.py` | WebSocket | Streams the audio over a raw **WebSocket** to Azure Speech using **Semantic segmentation**, and runs intent + sentiment + summary analysis on every final phrase. The baseline CLI client. |
+| `stt-speech-ws-llm-secs.py` | WebSocket | Same as above plus an optional **exact fixed-time segmentation** mode (`--interval N` / `-i N`): slices the audio client-side into precise N-second windows, one recognition turn per segment over a single connection. Without the flag it behaves like `stt-speech-ws-llm.py`. |
+| `stt-speech-llm.py` | Speech SDK | Equivalent pipeline built on the **Azure Speech SDK** (`PushAudioInputStream`) instead of a raw WebSocket, with Entra ID auth and Semantic segmentation. |
+| `stt-speech-ws-llm_app.py` | WebSocket | **Streamlit web UI**. Runs the WebSocket pipeline in a dedicated background thread and renders intent / sentiment / summary / latency from a thread-safe queue; includes a sidebar option for CSV output and an intent-descriptions panel. |
 
 ---
 
@@ -153,7 +168,62 @@ AZURE_OPENAI_SUMMARY_KEY=<key>
 Additional behavior is controlled by constants in `common_functions.py`:
 `LANGUAGE` (e.g. `en-GB` / `es-ES`), `DEFAULT_AUDIO_FILE`, `CHUNK_MS` (100 ms),
 `TARGET_SAMPLE_RATE` (16000), the display flags (`SHOW_INFO`, `SHOW_PARTIAL`,
-`SHOW_TIME`, `SHOW_DEBUG`), the closed `INTENTS` list and the `SENTIMENTS` list.
+`SHOW_TIME`, `SHOW_DEBUG`) and the `SENTIMENTS` list.
+
+The **intent taxonomy** is defined in `intents.csv` (columns `intent,description`).
+It is read at startup, the names populate `INTENTS` and the descriptions are
+injected into the prompt to help the model classify each phrase. Edit this file to
+add, remove or refine intents — no code changes required. Quote any description that
+contains commas. If the file is missing or unreadable, a built-in fallback list is
+used so the app still runs.
+
+## Model backends
+
+The LLM analysis runs on one of two interchangeable backends, selected with the
+`SERVERLESS_MODELS` flag. The audio pipeline, prompts and `intents.csv` are identical
+either way — only the model client changes.
+
+| | Azure OpenAI (`SERVERLESS_MODELS=False`, default) | Serverless open models (`SERVERLESS_MODELS=True`) |
+| --- | --- | --- |
+| Typical models | `gpt-4.1-mini`, `gpt-4o`, ... | Qwen, GPT-OSS, and other Azure AI Foundry serverless models |
+| SDK / package | `openai` (`AzureOpenAI`) | `azure-ai-inference` (`ChatCompletionsClient`) |
+| API | Responses API | Chat Completions API |
+| Auth | Entra ID only | API key if provided, otherwise Entra ID |
+| Server-side timing | Yes (`openai-processing-ms` header) | No (client wall-clock only) |
+
+### How to switch to serverless open models (Qwen / GPT-OSS)
+
+1. **Deploy the model** as a serverless / Models-as-a-Service endpoint in Azure AI
+   Foundry and copy its endpoint URL and model name.
+2. **Install the SDK**:
+
+   ```powershell
+   pip install azure-ai-inference
+   ```
+
+3. **Update `.env`**:
+
+   ```dotenv
+   SERVERLESS_MODELS=True
+   AZURE_OPENAI_INTENT_ENDPOINT=https://<your-foundry-endpoint>
+   AZURE_OPENAI_INTENT_MODEL=<model-name>          # e.g. Qwen2.5-7B-Instruct
+
+   # Optional: API key auth (otherwise Entra ID / DefaultAzureCredential is used).
+   AZURE_OPENAI_INTENT_KEY=<key>
+
+   # Optional: a different endpoint/model for the summary (defaults to intent).
+   # AZURE_OPENAI_SUMMARY_ENDPOINT=https://<your-foundry-endpoint>
+   # AZURE_OPENAI_SUMMARY_MODEL=<model-name>
+   # AZURE_OPENAI_SUMMARY_KEY=<key>
+   ```
+
+4. **Run any program as usual** — no code changes are needed.
+
+> **Notes:** with serverless models the CSV/`time` column reports the client
+> wall-clock time (no server-side header is available), so it is not directly
+> comparable to the server time reported for Azure OpenAI. Open models (especially
+> GPT-OSS) may emit reasoning text or code fences before the JSON; the built-in
+> `_extract_json` parser already tolerates that.
 
 ## Usage
 
@@ -223,7 +293,9 @@ relying on the service segmentation:
 5. **Analysis** — for each final `speech.phrase`, `analyze_phrase` calls the model
    and returns `{intent, sentiment, summary}` (robust JSON parsing tolerates code
    fences and reasoning preambles), plus client/server timing. The `sentiment` is
-   classified on the latest phrase only, while `summary` covers the whole call.
+   classified on the latest phrase only, while `summary` covers the whole call. The
+   intent is chosen from the taxonomy in `intents.csv`, whose descriptions are part
+   of the prompt to improve classification.
 
 ### Streamlit latency pattern
 

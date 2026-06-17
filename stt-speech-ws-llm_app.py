@@ -26,7 +26,7 @@ import streamlit as st
 
 from common_functions import (
     SPEECH_REGION, LANGUAGE, CHUNK_MS, TARGET_SAMPLE_RATE,
-    SHOW_INFO, SHOW_PARTIAL, SHOW_TIME, INTENTS, WS_URL,
+    SHOW_INFO, SHOW_PARTIAL, SHOW_TIME, INTENTS, INTENT_DESCRIPTIONS, WS_URL,
     AOAI_INTENT_MODEL, AOAI_SUMMARY_MODEL, USE_SEPARATE_INTENT_SUMMARY,
     AOAI_INTENT_ENDPOINT, AOAI_SUMMARY_ENDPOINT,
     DEFAULT_AUDIO_FILE,
@@ -294,7 +294,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Possible intents**")
-    st.write(", ".join(INTENTS))
+    # Show each intent with its description (loaded from intents.csv) when available.
+    if any(INTENT_DESCRIPTIONS.get(name) for name in INTENTS):
+        with st.expander("View intent descriptions"):
+            for name in INTENTS:
+                desc = INTENT_DESCRIPTIONS.get(name, "")
+                st.markdown(f"- **{name}**: {desc}" if desc else f"- **{name}**")
+    else:
+        st.write(", ".join(INTENTS))
 
 # Persistent state across reruns
 if "results" not in st.session_state:

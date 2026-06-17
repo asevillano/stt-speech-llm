@@ -52,6 +52,11 @@ DEFAULT_AUDIO_FILE = "customer-support-sample.wav"
 CHUNK_MS = 100  # Duration of each chunk (ms)
 TARGET_SAMPLE_RATE = 16000  # Required by the Speech service (16 kHz, mono, 16-bit PCM)
 
+# CSV file (next to this module) holding the intent taxonomy used by the LLM
+# prompts. It has two columns: "intent" and "description". Editing this file is
+# the supported way to add, remove or refine intents without touching the code.
+INTENTS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intents.csv")
+
 # Display control flags
 SHOW_INFO = False       # Show "[INFO]" messages
 SHOW_PARTIAL = False    # Show "[PARTIAL]" (intermediate hypothesis) messages
@@ -90,8 +95,51 @@ USE_SEPARATE_INTENT_SUMMARY = (
     or AOAI_INTENT_MODEL != AOAI_SUMMARY_MODEL
 )
 
-# Possible intents to detect for each phrase
-INTENTS = ["greetings", "request_info", "flight_details", "complain", "delay", "apology", "refund", "thanks", "closing"]
+# Possible intents to detect for each phrase, loaded from INTENTS_CSV at startup.
+# INTENTS is the list of intent names (used for display); INTENT_DESCRIPTIONS keeps
+# the per-intent descriptions used to build the LLM prompt.
+def _load_intents(path):
+    """Reads the intent taxonomy from a CSV with columns 'intent' and 'description'.
+    Returns (names, descriptions_dict). Falls back to a built-in list if the file
+    is missing or unreadable, so the app still runs."""
+    fallback = [
+        ("greetings", ""), ("request_info", ""), ("flight_details", ""),
+        ("complain", ""), ("delay", ""), ("apology", ""), ("refund", ""),
+        ("thanks", ""), ("closing", ""),
+    ]
+    rows = fallback
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            parsed = [
+                (r["intent"].strip(), (r.get("description") or "").strip())
+                for r in csv.DictReader(f)
+                if r.get("intent") and r["intent"].strip()
+            ]
+        if parsed:
+            rows = parsed
+    except (OSError, KeyError) as ex:
+        print(f"[STARTUP] Could not read intents from {path}: {ex}. Using defaults.")
+    names = [name for name, _ in rows]
+    descriptions = {name: desc for name, desc in rows}
+    return names, descriptions
+
+
+INTENTS, INTENT_DESCRIPTIONS = _load_intents(INTENTS_CSV)
+
+
+def _format_intents_block():
+    """Builds the bulleted intent list (with descriptions when available) injected
+    into the prompts. Falls back to a comma-separated list when no descriptions."""
+    if any(INTENT_DESCRIPTIONS.get(name) for name in INTENTS):
+        lines = []
+        for name in INTENTS:
+            desc = INTENT_DESCRIPTIONS.get(name)
+            lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+        return "\n".join(lines)
+    return ", ".join(INTENTS)
+
+
+_INTENTS_BLOCK = _format_intents_block()
 
 # Possible sentiments to detect for each (latest) phrase. The sentiment is always
 # evaluated on the LATEST phrase alone, never on the accumulated conversation.
@@ -100,7 +148,8 @@ SENTIMENTS = ["positive", "neutral", "negative"]
 # System prompt for intent detection and running conversation summary (single call)
 ANALYSIS_SYSTEM_PROMPT = (
     "You are an assistant that analyzes a customer support phone call transcription.\n"
-    f"For the latest customer phrase, identify its intent. The possible intents are: {', '.join(INTENTS)}.\n"
+    "For the latest customer phrase, identify its intent. The possible intents are:\n"
+    f"{_INTENTS_BLOCK}\n"
     "If none clearly applies, use \"none\".\n"
     f"Also classify the sentiment of ONLY the latest phrase as one of: {', '.join(SENTIMENTS)}.\n"
     "Also produce a SHORT summary of the whole conversation so far. The summary must "
@@ -115,7 +164,8 @@ ANALYSIS_SYSTEM_PROMPT = (
 # Intent and sentiment are both per-latest-phrase, so they share this prompt/call.
 INTENT_SYSTEM_PROMPT = (
     "You are an assistant that analyzes a customer support phone call transcription.\n"
-    f"For the latest customer phrase, identify its intent. The possible intents are: {', '.join(INTENTS)}.\n"
+    "For the latest customer phrase, identify its intent. The possible intents are:\n"
+    f"{_INTENTS_BLOCK}\n"
     "If none clearly applies, use \"none\".\n"
     f"Also classify the sentiment of ONLY the latest phrase as one of: {', '.join(SENTIMENTS)}.\n"
     "Respond ONLY with a valid JSON object with exactly these keys: "
