@@ -235,7 +235,7 @@ with st.sidebar:
     else:
         st.text(f"Model: {AOAI_INTENT_MODEL}")
         st.text(f"Endpoint: {AOAI_INTENT_ENDPOINT}")
-    st.text(f"Chunk: {CHUNK_MS} ms")
+    #st.text(f"Chunk: {CHUNK_MS} ms")
 
     st.markdown("---")
     st.subheader("Audio source")
