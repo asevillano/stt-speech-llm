@@ -90,6 +90,85 @@ flowchart TD
 
 ---
 
+## Processing pipeline
+
+End-to-end flow of a `.wav` file: audio normalization, streaming to Azure Speech,
+transcription, and per-phrase analysis by the text model (intent + sentiment +
+summary). Implemented across `common_functions.py` and the entry-point scripts.
+
+### Stage 1 — Audio normalization and streaming
+
+`load_audio_16k_mono` + `create_audio_message` in `common_functions.py`:
+
+```mermaid
+flowchart LR
+    WAV["WAV file\nany rate / channels / bit depth"]
+
+    subgraph Decode["Decode (per sample width)"]
+        D8["8-bit unsigned\n(x - 128) / 128"]
+        D16["16-bit signed\nx / 32768"]
+        D32["32-bit signed\nx / 2147483648"]
+    end
+
+    FLOAT["float32 samples\nrange [-1, 1]"]
+    MONO["Downmix to mono\naverage channels"]
+    RESAMPLE["Resample to 16 kHz\nlinear interpolation\n(np.interp)"]
+    PCM16["Encode 16-bit PCM\nclip + int16 bytes"]
+    CHUNK["Chunker\n100 ms slices (CHUNK_MS)"]
+    MSG["create_audio_message\nbinary WS frame\n(audio + X-RequestId)"]
+    SPEECH["Azure Speech-to-Text\nWebSocket / push stream"]
+
+    WAV --> Decode --> FLOAT --> MONO --> RESAMPLE --> PCM16 --> CHUNK --> MSG --> SPEECH
+```
+
+Conversion only runs where needed: mono downmix is skipped for single-channel
+audio, and resampling is skipped when the source is already 16 kHz. The output is
+always **16 kHz mono 16-bit PCM**, as required by the Speech service.
+
+### Stage 2 — Transcription and text-model analysis
+
+Each final phrase returned by Speech is analyzed by the LLM and emitted as a result:
+
+```mermaid
+flowchart TD
+    SPEECH["Azure Speech-to-Text\nSemantic segmentation"]
+    PARTIAL["speech.hypothesis\n(partial, optional display)"]
+    PHRASE["speech.phrase\nfinal phrase text"]
+    ACC["Accumulate conversation\nlatest phrase + full transcript"]
+    ANALYZE["analyze_phrase\n(common_functions.py)"]
+
+    subgraph Model["Text model (Azure OpenAI / AI Inference)"]
+        COMBINED["Single combined call\nintent + sentiment + summary\n(same endpoint/model)"]
+        SPLIT["Two parallel calls\nintent+sentiment / summary\n(ThreadPoolExecutor)"]
+    end
+
+    JSON["Parse JSON response\n(_extract_json)"]
+    RESULT["Result:\nintent + sentiment + summary\n+ server/client latency"]
+
+    OUT_CLI["CLI output\n[INTENT] [SENTIMENT] [SUMMARY] [TIME]"]
+    OUT_UI["Streamlit UI\n(via thread-safe queue)"]
+    OUT_CSV["Optional CSV row\n(ResultsCsvWriter)"]
+
+    SPEECH -.-> PARTIAL
+    SPEECH --> PHRASE --> ACC --> ANALYZE
+    ANALYZE --> COMBINED
+    ANALYZE --> SPLIT
+    COMBINED --> JSON
+    SPLIT --> JSON
+    JSON --> RESULT
+    RESULT --> OUT_CLI
+    RESULT --> OUT_UI
+    RESULT --> OUT_CSV
+```
+
+`analyze_phrase` runs a **single combined call** when intent and summary share the
+same endpoint/model, or **two parallel calls** when they differ. Intent and
+sentiment are always evaluated on the **latest phrase only**, while the summary is
+maintained cumulatively over the full transcript. Latency is reported from the
+server processing headers with a client wall-clock fallback.
+
+---
+
 ## Key files
 
 | File | Description |
