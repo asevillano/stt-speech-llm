@@ -1,0 +1,12 @@
+# Core dependencies for the real-time STT + LLM pipeline
+azure-cognitiveservices-speech   # Speech SDK (used by stt-speech-llm.py)
+websockets                       # WebSocket streaming to Azure Speech STT
+numpy                            # Audio conversion to 16 kHz mono 16-bit PCM
+openai                           # Azure OpenAI client (Responses API)
+azure-identity                   # Entra ID auth (DefaultAzureCredential)
+python-dotenv                    # Loads configuration from .env
+streamlit                        # Web UI (stt-speech-ws-llm_app.py)
+
+# Optional: only required when SERVERLESS_MODELS=True (open models such as
+# Qwen / GPT-OSS via Azure AI Inference chat completions API)
+azure-ai-inference

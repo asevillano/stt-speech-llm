@@ -1,0 +1,34 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Streamlit uploads
+uploads/
+
+# Output / logs
+output_*.txt
+*.log
+*.csv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Other
+OLD/
+.github/copilot-instructions.md
