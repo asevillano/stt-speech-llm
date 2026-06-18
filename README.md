@@ -151,6 +151,7 @@ server processing headers with a client wall-clock fallback.
 | `stt-speech-llm.py` | CLI client using the **Azure Speech SDK** (`PushAudioInputStream`) with Entra ID auth and Semantic segmentation. |
 | `stt-speech-ws-llm_app.py` | **Streamlit** web UI. The pipeline runs in a dedicated background thread; the UI only reads results from a thread-safe queue. |
 | `intents.csv` | Editable intent taxonomy (`intent,description` columns) loaded at startup and injected into the LLM prompt. |
+| `banking_prompts/` | Prompt payloads for the banking variant: `intent.json`, `sentiment.json`, `summary.json` (baseline), plus `intent-gpt5.json`, `sentiment-gpt5.json`, `summary-gpt5.json` (the same tasks rewritten for `gpt-5.x` best practices). |
 | `customer-support-sample.wav` | Default sample audio file. |
 
 ---
