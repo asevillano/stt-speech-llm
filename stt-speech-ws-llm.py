@@ -1,7 +1,6 @@
 #pip install azure-cognitiveservices-speech websockets aiohttp
 import asyncio
 import websockets
-import wave
 import json
 import uuid
 
@@ -12,6 +11,7 @@ from common_functions import (
     load_audio_16k_mono, create_aoai_clients, warmup_aoai, analyze_phrase,
     get_auth_token, create_speech_config_message,
     create_speech_context_message, create_audio_message,
+    print_audio_info, iter_audio_connection_slices,
     ResultsCsvWriter,
 )
 
@@ -31,14 +31,7 @@ warmup_aoai(aoai_clients)
 print("[STARTUP] Azure OpenAI client ready.")
 
 # Check audio information
-with wave.open(AUDIO_FILE, "rb") as wf:
-    print(f"Audio information:")
-    print(f"\tAudio file: {AUDIO_FILE}")
-    print(f"\tChannels: {wf.getnchannels()}")
-    print(f"\tSample rate: {wf.getframerate()} Hz")
-    print(f"\tBits per sample: {wf.getsampwidth() * 8}")
-    print(f"\tRequired format: 16000 Hz, mono, 16-bit PCM")
-    print()
+print_audio_info(AUDIO_FILE)
 
 # Pre-load and convert the audio once so it can be streamed in chunks.
 AUDIO_PCM_16K = load_audio_16k_mono(AUDIO_FILE)
@@ -48,10 +41,19 @@ print(f"Possible intents to detect: {', '.join(INTENTS)}")
 print()
 
 
-async def receive_messages(ws):
-    """Task to receive messages from the server."""
-    # Accumulates all completed phrases of the conversation
-    conversation_phrases = []
+async def receive_messages(ws, conversation_phrases, analysis_queue):
+    """Task to receive messages from the server.
+
+    'conversation_phrases' is owned by the caller and shared across reconnections,
+    so the LLM keeps the full conversation context when a long audio is streamed
+    over several back-to-back WebSocket connections.
+
+    The (multi-second) LLM analysis is NOT run here: each final phrase is handed
+    off to a background worker via 'analysis_queue' so this loop keeps draining the
+    socket. Otherwise the blocking LLM call would stall the receive loop, the
+    websockets keepalive ping would time out, and the connection would be closed
+    with 1011 (internal error) keepalive ping timeout.
+    """
     try:
         async for message in ws:
             if isinstance(message, str):
@@ -74,33 +76,14 @@ async def receive_messages(ws):
                         
                         if recognition_status == 'Success':
                             display_text = result.get('DisplayText', '')
-                            print("-"*50)
-                            print(f"[TRANSCRIPTION] {display_text}")
 
-                            # Accumulate the phrase and analyze it with the LLM
+                            # Accumulate the phrase and hand the analysis off to the
+                            # background worker, keeping this receive loop free to
+                            # drain the socket (prevents the 1011 keepalive timeout).
                             if display_text.strip():
                                 conversation_phrases.append(display_text)
                                 full_conversation = " ".join(conversation_phrases)
-                                # Run the (blocking) LLM call without blocking the event loop
-                                analysis = await asyncio.to_thread(
-                                    analyze_phrase, aoai_clients, display_text, full_conversation
-                                )
-                                if analysis and "error" not in analysis:
-                                    print(f"[INTENT] {analysis.get('intent', 'unknown')}")
-                                    print(f"[SENTIMENT] {analysis.get('sentiment', 'unknown')}")
-                                    print(f"[SUMMARY] {analysis.get('summary', '')}")
-                                    if SHOW_TIME:
-                                        client_s = analysis.get('elapsed_s', 0)
-                                        server_s = analysis.get('server_elapsed_s')
-                                        if server_s is not None:
-                                            print(f"[TIME] Text model call: {server_s:.3f} s (server) | {client_s:.3f} s (client)")
-                                        else:
-                                            print(f"[TIME] Text model call: {client_s:.3f} s")
-                                    #print("-"*50)
-                                    if csv_writer:
-                                        csv_writer.write_row(display_text, analysis)
-                                elif analysis and "error" in analysis:
-                                    print(f"[ERROR] LLM analysis failed: {analysis['error']}")
+                                await analysis_queue.put((display_text, full_conversation))
                         elif recognition_status == 'NoMatch':
                             print_info(f"[INFO] No speech detected in this segment")
                         else:
@@ -124,11 +107,57 @@ async def receive_messages(ws):
     except Exception as e:
         print(f"[ERROR] Error receiving messages: {e}")
 
-async def stream_audio():
+
+async def analysis_worker(analysis_queue):
+    """Background consumer that runs the LLM analysis serially, one phrase at a
+    time, in arrival order. It lives for the whole stream (across all connections)
+    so the LLM context, console output and CSV rows stay ordered even though the
+    receive loop never waits for the (multi-second) LLM call.
+
+    A None item is the sentinel that tells the worker to stop once the queue has
+    been fully drained."""
+    while True:
+        item = await analysis_queue.get()
+        try:
+            if item is None:
+                return
+            display_text, full_conversation = item
+            print("-" * 50)
+            print(f"[TRANSCRIPTION] {display_text}")
+            # Run the (blocking) LLM call without blocking the event loop
+            analysis = await asyncio.to_thread(
+                analyze_phrase, aoai_clients, display_text, full_conversation
+            )
+            if analysis and "error" not in analysis:
+                print(f"[INTENT] {analysis.get('intent', 'unknown')}")
+                print(f"[SENTIMENT] {analysis.get('sentiment', 'unknown')}")
+                print(f"[SUMMARY] {analysis.get('summary', '')}")
+                if SHOW_TIME:
+                    client_s = analysis.get('elapsed_s', 0)
+                    server_s = analysis.get('server_elapsed_s')
+                    if server_s is not None:
+                        print(f"[TIME] Text model call: {server_s:.3f} s (server) | {client_s:.3f} s (client)")
+                    else:
+                        print(f"[TIME] Text model call: {client_s:.3f} s")
+                if csv_writer:
+                    csv_writer.write_row(display_text, analysis)
+            elif analysis and "error" in analysis:
+                print(f"[ERROR] LLM analysis failed: {analysis['error']}")
+        finally:
+            analysis_queue.task_done()
+
+async def stream_audio_connection(audio_bytes, conversation_phrases, analysis_queue, connection_index, total_connections):
+    """Streams one slice of audio over a single WebSocket connection.
+
+    A fresh connection (new token, request id and config) is opened for every
+    slice; 'conversation_phrases' is shared so the LLM context spans all of them.
+    """
     print("[STARTUP] Getting authentication token...")
     token = await get_auth_token()
     request_id = str(uuid.uuid4()).replace('-', '')
 
+    if total_connections > 1:
+        print_info(f"[INFO] Connection {connection_index}/{total_connections}")
     print_info(f"[INFO] Connecting to Azure Speech Service...")
     print_info(f"[INFO] Request ID: {request_id}")
 
@@ -153,10 +182,9 @@ async def stream_audio():
         print_info("[INFO] Speech context (Semantic segmentation) sent")
 
         # Start the task to receive messages
-        receive_task = asyncio.create_task(receive_messages(ws))
+        receive_task = asyncio.create_task(receive_messages(ws, conversation_phrases, analysis_queue))
 
         # 2. Send audio in chunks (already converted to 16 kHz mono 16-bit PCM)
-        print("[STARTUP] Starting streaming audio in Real-Time\n")
         # Bytes per chunk: 16-bit (2 bytes) * TARGET_SAMPLE_RATE * CHUNK_MS
         bytes_per_sample = 2
         bytes_per_chunk = int(TARGET_SAMPLE_RATE * (CHUNK_MS / 1000.0)) * bytes_per_sample
@@ -165,8 +193,8 @@ async def stream_audio():
         print_info(f"[INFO] Chunks of {bytes_per_chunk} bytes ({CHUNK_MS}ms)")
 
         chunk_count = 0
-        for offset in range(0, len(AUDIO_PCM_16K), bytes_per_chunk):
-            data = AUDIO_PCM_16K[offset:offset + bytes_per_chunk]
+        for offset in range(0, len(audio_bytes), bytes_per_chunk):
+            data = audio_bytes[offset:offset + bytes_per_chunk]
             if not data:
                 break
 
@@ -181,17 +209,55 @@ async def stream_audio():
             # Simulate real-time streaming
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
-        print_info(f"[INFO] Full audio sent ({chunk_count} chunks)")
-        
-        # 3. Send an empty audio message to signal the end
+        print_info(f"[INFO] Audio slice sent ({chunk_count} chunks)")
+
+        # 3. Send an empty audio message to signal the end of this turn
         final_message = create_audio_message(request_id, b'')
         await ws.send(final_message)
         print_info("[INFO] End-of-stream message sent")
-        
-        # 4. Wait to receive all results
+
+        # 4. Wait to receive all results for this connection
         await receive_task
-        
-        print_info("[INFO] Process completed")
+
+
+async def stream_audio():
+    # Conversation transcript, shared across all connections so the LLM context is
+    # preserved when a long audio is split over several WebSocket connections.
+    conversation_phrases = []
+
+    # Single analysis queue + worker for the whole stream. The receive loop only
+    # enqueues phrases (never blocks on the LLM), and this worker runs the analysis
+    # serially in arrival order, so the console output and CSV rows stay ordered
+    # and the websockets keepalive never times out during the LLM call.
+    analysis_queue = asyncio.Queue()
+    worker_task = asyncio.create_task(analysis_worker(analysis_queue))
+
+    # Azure Speech closes a connection after ~635 s of total duration, so the audio
+    # is split into slices of at most MAX_CONNECTION_AUDIO_SECONDS each, every slice
+    # streamed over its own back-to-back connection.
+    slices = list(iter_audio_connection_slices(AUDIO_PCM_16K))
+    total_connections = len(slices)
+
+    print("[STARTUP] Starting streaming audio in Real-Time\n")
+    if total_connections > 1:
+        total_seconds = len(AUDIO_PCM_16K) / (TARGET_SAMPLE_RATE * 2)
+        print_info(
+            f"[INFO] Audio is {total_seconds:.0f}s long; it will be streamed over "
+            f"{total_connections} connections to stay within the ~635s WebSocket limit."
+        )
+
+    for connection_index, _total, audio_slice in slices:
+        await stream_audio_connection(
+            audio_slice, conversation_phrases, analysis_queue, connection_index, total_connections
+        )
+
+    # All audio streamed: wait for the backlog of queued analyses to drain, then
+    # stop the worker via the None sentinel.
+    await analysis_queue.join()
+    await analysis_queue.put(None)
+    await worker_task
+
+    print_info("[INFO] Process completed")
 
 if __name__ == "__main__":
     try:

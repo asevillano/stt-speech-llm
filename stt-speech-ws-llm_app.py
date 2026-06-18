@@ -18,6 +18,7 @@ import asyncio
 import websockets
 import os
 import json
+import time
 import uuid
 import queue
 import threading
@@ -29,11 +30,12 @@ from common_functions import (
     SHOW_INFO, SHOW_PARTIAL, SHOW_TIME, INTENTS, INTENT_DESCRIPTIONS, WS_URL,
     AOAI_INTENT_MODEL, AOAI_SUMMARY_MODEL, USE_SEPARATE_INTENT_SUMMARY,
     AOAI_INTENT_ENDPOINT, AOAI_SUMMARY_ENDPOINT,
-    DEFAULT_AUDIO_FILE,
+    DEFAULT_AUDIO_FILE, MAX_CONNECTION_AUDIO_SECONDS,
     load_audio_16k_mono, describe_audio,
     create_aoai_clients, warmup_aoai, analyze_phrase,
     get_auth_token, create_speech_config_message,
     create_speech_context_message, create_audio_message,
+    iter_audio_connection_slices,
     warmup_speech_token, ResultsCsvWriter,
 )
 
@@ -43,6 +45,11 @@ AUDIO_FILE = DEFAULT_AUDIO_FILE  # default selection
 # Directory used both to list local .wav files and to store uploaded audio
 AUDIO_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(AUDIO_DIR, "uploads")
+
+# Grace period (seconds) to wait for the final turn.end after a slice has been
+# fully streamed. Guards against a connection that stops responding and would
+# otherwise hang the worker forever; on timeout we reconnect/move on.
+TURN_END_GRACE_SECONDS = float(os.getenv("TURN_END_GRACE_SECONDS", "60"))
 
 
 @st.cache_resource(show_spinner=False)
@@ -58,12 +65,14 @@ def get_aoai_client():
     return clients
 
 
-async def receive_messages(ws, aoai_client, event_queue):
+async def receive_messages(ws, aoai_client, event_queue, state):
     """Task to receive messages from the server. Pushes results to event_queue
     instead of printing, so the UI thread can render them without being in the
-    recognition/LLM critical path."""
-    # Accumulates all completed phrases of the conversation
-    conversation_phrases = []
+    recognition/LLM critical path.
+
+    'state' holds the running conversation and the monotonic phrase id; it is owned
+    by the caller and shared across reconnections, so transcripts and ids stay
+    coherent when a long audio is streamed over several WebSocket connections."""
     try:
         async for message in ws:
             if isinstance(message, str):
@@ -89,14 +98,26 @@ async def receive_messages(ws, aoai_client, event_queue):
 
                             # Accumulate the phrase and analyze it with the LLM
                             if display_text.strip():
-                                conversation_phrases.append(display_text)
-                                full_conversation = " ".join(conversation_phrases)
+                                state["phrase_id"] += 1
+                                phrase_id = state["phrase_id"]
+                                state["conversation_phrases"].append(display_text)
+                                full_conversation = " ".join(state["conversation_phrases"])
+                                # Emit the transcription immediately so the UI can
+                                # render it without waiting for the LLM response.
+                                event_queue.put({
+                                    "type": "transcription",
+                                    "id": phrase_id,
+                                    "text": display_text,
+                                })
                                 # Run the (blocking) LLM call without blocking the event loop
                                 analysis = await asyncio.to_thread(
                                     analyze_phrase, aoai_client, display_text, full_conversation
                                 )
+                                # Emit the analysis as a follow-up event correlated
+                                # by id, so the UI fills in the matching phrase.
                                 event_queue.put({
-                                    "type": "phrase",
+                                    "type": "analysis",
+                                    "id": phrase_id,
                                     "text": display_text,
                                     "analysis": analysis,
                                 })
@@ -129,66 +150,271 @@ async def receive_messages(ws, aoai_client, event_queue):
         event_queue.put({"type": "error", "text": f"Error receiving messages: {e}"})
 
 
-async def stream_audio(aoai_client, event_queue, audio_file):
+async def receive_segment(ws, event_queue):
+    """Receiver used in FIXED-TIME SEGMENT mode: reads the messages of the CURRENT
+    recognition turn and returns the list of final phrase texts once turn.end is
+    received. The audio fed to this turn is an exact client-side slice, so its time
+    boundaries are precise regardless of the service's internal segmentation."""
+    phrases = []
+    try:
+        async for message in ws:
+            if not isinstance(message, str):
+                continue
+            lines = message.split('\r\n\r\n', 1)
+            if len(lines) <= 1:
+                continue
+            headers_text, body = lines[0], lines[1]
+            path = None
+            for line in headers_text.split('\r\n'):
+                if line.startswith('Path:'):
+                    path = line.split(':', 1)[1]
+                    break
+
+            if path == 'speech.phrase':
+                result = json.loads(body)
+                if result.get('RecognitionStatus') == 'Success':
+                    display_text = result.get('DisplayText', '')
+                    if display_text.strip():
+                        phrases.append(display_text)
+                elif result.get('RecognitionStatus') == 'NoMatch':
+                    if SHOW_INFO:
+                        event_queue.put({"type": "info", "text": "No speech detected in this segment"})
+            elif path == 'speech.hypothesis':
+                if SHOW_PARTIAL:
+                    result = json.loads(body)
+                    event_queue.put({"type": "partial", "text": result.get('Text', '')})
+            elif path == 'turn.end':
+                # End of this segment's turn: return everything collected.
+                return phrases
+    except websockets.ConnectionClosed:
+        if SHOW_INFO:
+            event_queue.put({"type": "info", "text": "Connection closed by the server"})
+    return phrases
+
+
+async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=None):
     """Connects to Azure Speech Service over WebSocket, streams the audio in
-    real time and drives the receive/analysis loop."""
-    token = await get_auth_token()
-    request_id = str(uuid.uuid4()).replace('-', '')
+    real time and drives the receive/analysis loop.
 
-    # Entra ID authentication via Authorization header
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+    When ``interval_seconds`` is None, Semantic segmentation is used and each final
+    phrase is analyzed as it arrives (continuous turn). When it is a number, the
+    audio is sliced client-side into exact N-second segments, each sent as its own
+    recognition turn, and analyzed once fully transcribed.
 
-    event_queue.put({"type": "status", "text": "Connected to Azure Speech Service"})
-    async with websockets.connect(WS_URL, additional_headers=headers, max_size=10**7) as ws:
-        # 1. Send the configuration message
-        config_message = create_speech_config_message(request_id)
-        await ws.send(config_message)
+    Azure Speech closes a connection after ~635 s of total duration, so long audio
+    is streamed over several back-to-back connections; the running conversation and
+    phrase ids are shared across them so the LLM context and the UI ids stay
+    coherent."""
+    # Pre-load and convert the audio once so it can be streamed in chunks.
+    audio_pcm = load_audio_16k_mono(audio_file)
+    # Bytes per chunk: 16-bit (2 bytes) * TARGET_SAMPLE_RATE * CHUNK_MS
+    bytes_per_chunk = int(TARGET_SAMPLE_RATE * (CHUNK_MS / 1000.0)) * 2
 
-        # 1b. Send the speech.context message to enable Semantic segmentation
-        context_message = create_speech_context_message(request_id)
-        await ws.send(context_message)
+    # Shared state across all connections (LLM context + monotonic phrase id).
+    state = {"conversation_phrases": [], "phrase_id": 0}
 
-        # Start the task to receive messages
-        receive_task = asyncio.create_task(receive_messages(ws, aoai_client, event_queue))
+    if interval_seconds is None:
+        # ----------------------- SEMANTIC MODE (default) -----------------------
+        # Long audio is split into back-to-back connections (each up to the
+        # ~635s WebSocket limit), with semantic segmentation per connection. If a
+        # connection drops mid-slice (duration limit reached early or a 1012
+        # service restart), we reconnect and RESUME the same slice from the last
+        # byte we managed to send, so already-transcribed audio is not re-sent
+        # (no duplicate phrases) and no audio is lost. A bounded grace timeout on
+        # the final turn.end guards against a connection that goes silent and
+        # would otherwise hang the worker forever.
+        slices = list(iter_audio_connection_slices(audio_pcm))
+        total_connections = len(slices)
+        for connection_index, _total, audio_slice in slices:
+            sent_offset = 0
+            attempts = 0
+            while sent_offset < len(audio_slice):
+                attempts += 1
+                token = await get_auth_token()
+                request_id = str(uuid.uuid4()).replace('-', '')
+                headers = {"Authorization": f"Bearer {token}"}
 
-        # 2. Send audio in chunks (converted to 16 kHz mono 16-bit PCM)
+                if total_connections > 1:
+                    event_queue.put({"type": "status",
+                                     "text": f"Connected to Azure Speech Service "
+                                             f"(connection {connection_index}/{total_connections})"})
+                else:
+                    event_queue.put({"type": "status", "text": "Connected to Azure Speech Service"})
+
+                ws = None
+                receive_task = None
+                try:
+                    ws = await websockets.connect(WS_URL, additional_headers=headers, max_size=10**7)
+                    # 1. Send the configuration message (connection-level, sent once).
+                    await ws.send(create_speech_config_message(request_id))
+                    # 1b. Send the speech.context message to enable Semantic segmentation
+                    await ws.send(create_speech_context_message(request_id))
+
+                    # Start the task to receive messages
+                    receive_task = asyncio.create_task(
+                        receive_messages(ws, aoai_client, event_queue, state)
+                    )
+
+                    # 2. Send audio in chunks (converted to 16 kHz mono 16-bit PCM),
+                    # resuming from the last byte sent on previous attempts.
+                    event_queue.put({"type": "status", "text": "Streaming audio in real time..."})
+                    for offset in range(sent_offset, len(audio_slice), bytes_per_chunk):
+                        data = audio_slice[offset:offset + bytes_per_chunk]
+                        if not data:
+                            break
+                        await ws.send(create_audio_message(request_id, data))
+                        sent_offset = offset + len(data)
+                        # Simulate real-time streaming
+                        await asyncio.sleep(CHUNK_MS / 1000.0)
+
+                    # 3. Send an empty audio message to signal the end of this turn
+                    await ws.send(create_audio_message(request_id, b''))
+
+                    # 4. Wait (bounded) to receive all results for this connection
+                    await asyncio.wait_for(receive_task, timeout=TURN_END_GRACE_SECONDS)
+                    # Slice fully streamed and finalized; move to the next slice.
+                    break
+                except (websockets.ConnectionClosed, asyncio.TimeoutError) as ex:
+                    # The connection dropped mid-slice or stopped sending turn.end.
+                    # Reconnect and resume this slice from the last byte sent.
+                    if receive_task is not None:
+                        receive_task.cancel()
+                    reason = ("timed out waiting for turn.end"
+                              if isinstance(ex, asyncio.TimeoutError) else "connection closed")
+                    if attempts >= 5:
+                        event_queue.put({"type": "error",
+                                         "text": f"Giving up on connection {connection_index} "
+                                                 f"after {attempts} attempts ({reason})"})
+                        break
+                    event_queue.put({"type": "status",
+                                     "text": f"Reconnecting ({reason}); resuming "
+                                             f"connection {connection_index}..."})
+                finally:
+                    if ws is not None:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+    else:
+        # ----------------- SEGMENT MODE (exact X-second slices) ----------------
+        # Slice the audio into exact interval_seconds segments, each sent as its
+        # OWN recognition turn (fresh X-RequestId). Unlike the semantic mode, the
+        # LLM analysis runs synchronously BETWEEN segments, so the connection's
+        # wall-clock grows by audio time PLUS analysis time. We track the real
+        # elapsed wall-clock per connection and open a fresh connection before it
+        # would exceed the budget, and we retry a segment over a new connection if
+        # the current one drops (duration limit or 1012 service restart).
+        bytes_per_sample = 2
+        bytes_per_segment = int(TARGET_SAMPLE_RATE * interval_seconds) * bytes_per_sample
+        total_bytes = len(audio_pcm)
+        seconds_per_byte = 1.0 / (TARGET_SAMPLE_RATE * bytes_per_sample)
+
+        seg_starts = list(range(0, total_bytes, bytes_per_segment))
+
+        # Current connection and the wall-clock time (monotonic) at which it opened.
+        conn = {"ws": None, "start": 0.0, "index": 0}
+
+        async def open_connection():
+            token = await get_auth_token()
+            conn_request_id = str(uuid.uuid4()).replace('-', '')
+            headers = {"Authorization": f"Bearer {token}"}
+            conn["index"] += 1
+            event_queue.put({"type": "status",
+                             "text": f"Connected to Azure Speech Service "
+                                     f"(connection {conn['index']})"})
+            conn["ws"] = await websockets.connect(WS_URL, additional_headers=headers, max_size=10**7)
+            await conn["ws"].send(create_speech_config_message(conn_request_id))
+            conn["start"] = time.monotonic()
+
+        async def close_connection():
+            if conn["ws"] is not None:
+                try:
+                    await conn["ws"].close()
+                except Exception:
+                    pass
+                conn["ws"] = None
+
         event_queue.put({"type": "status", "text": "Streaming audio in real time..."})
-        audio_pcm = load_audio_16k_mono(audio_file)
-        # Bytes per chunk: 16-bit (2 bytes) * TARGET_SAMPLE_RATE * CHUNK_MS
-        bytes_per_chunk = int(TARGET_SAMPLE_RATE * (CHUNK_MS / 1000.0)) * 2
+        try:
+            for seg_start in seg_starts:
+                seg_end = min(seg_start + bytes_per_segment, total_bytes)
+                start_s = seg_start * seconds_per_byte
+                end_s = seg_end * seconds_per_byte
 
-        chunk_count = 0
-        for offset in range(0, len(audio_pcm), bytes_per_chunk):
-            data = audio_pcm[offset:offset + bytes_per_chunk]
-            if not data:
-                break
+                phrases = None
+                attempts = 0
+                while phrases is None:
+                    attempts += 1
+                    # (Re)connect if there is no connection yet, or if streaming this
+                    # segment would push the connection's wall-clock past the budget.
+                    if (conn["ws"] is None or
+                            (time.monotonic() - conn["start"] + interval_seconds) > MAX_CONNECTION_AUDIO_SECONDS):
+                        await close_connection()
+                        await open_connection()
 
-            # Create audio message with binary header
-            audio_message = create_audio_message(request_id, data)
-            await ws.send(audio_message)
+                    segment_request_id = str(uuid.uuid4()).replace('-', '')
+                    recv_task = asyncio.create_task(receive_segment(conn["ws"], event_queue))
+                    try:
+                        # Stream this segment's audio chunks, paced for real time.
+                        for offset in range(seg_start, seg_end, bytes_per_chunk):
+                            data = audio_pcm[offset:min(offset + bytes_per_chunk, seg_end)]
+                            if not data:
+                                break
+                            await conn["ws"].send(create_audio_message(segment_request_id, data))
+                            await asyncio.sleep(CHUNK_MS / 1000.0)  # simulate real time
 
-            chunk_count += 1
+                        # End this turn so the service finalizes exactly this segment.
+                        await conn["ws"].send(create_audio_message(segment_request_id, b''))
+                        phrases = await recv_task
+                    except websockets.ConnectionClosed:
+                        # Connection dropped mid-segment (duration limit or 1012
+                        # service restart). Reconnect and retry this same segment.
+                        recv_task.cancel()
+                        await close_connection()
+                        if attempts >= 5:
+                            event_queue.put({"type": "error",
+                                             "text": f"Giving up on segment "
+                                                     f"{start_s:g}-{end_s:g}s after {attempts} attempts"})
+                            phrases = []
+                        else:
+                            event_queue.put({"type": "status",
+                                             "text": f"Connection closed during segment "
+                                                     f"{start_s:g}-{end_s:g}s; reconnecting..."})
 
-            # Simulate real-time streaming
-            await asyncio.sleep(CHUNK_MS / 1000.0)
+                segment_text = " ".join(phrases).strip()
+                if segment_text:
+                    state["phrase_id"] += 1
+                    phrase_id = state["phrase_id"]
+                    state["conversation_phrases"].append(segment_text)
+                    full_conversation = " ".join(state["conversation_phrases"])
+                    # Emit the transcription immediately, with its exact time range.
+                    event_queue.put({
+                        "type": "transcription",
+                        "id": phrase_id,
+                        "text": segment_text,
+                        "range": f"{start_s:g}-{end_s:g}s",
+                    })
+                    # Run the (blocking) LLM call without blocking the event loop.
+                    analysis = await asyncio.to_thread(
+                        analyze_phrase, aoai_client, segment_text, full_conversation
+                    )
+                    event_queue.put({
+                        "type": "analysis",
+                        "id": phrase_id,
+                        "text": segment_text,
+                        "analysis": analysis,
+                    })
+        finally:
+            await close_connection()
 
-        # 3. Send an empty audio message to signal the end
-        final_message = create_audio_message(request_id, b'')
-        await ws.send(final_message)
-
-        # 4. Wait to receive all results
-        await receive_task
-
-        event_queue.put({"type": "status", "text": "Process completed"})
+    event_queue.put({"type": "status", "text": "Process completed"})
 
 
-def run_pipeline(aoai_client, event_queue, audio_file):
+def run_pipeline(aoai_client, event_queue, audio_file, interval_seconds=None):
     """Worker entry point: runs the asyncio pipeline in its own thread with its
     own event loop, fully decoupled from Streamlit's rerun loop."""
     try:
-        asyncio.run(stream_audio(aoai_client, event_queue, audio_file))
+        asyncio.run(stream_audio(aoai_client, event_queue, audio_file, interval_seconds))
     except Exception as e:
         event_queue.put({"type": "error", "text": str(e)})
     finally:
@@ -280,6 +506,29 @@ with st.sidebar:
             st.warning(f"Format: {desc} (required: 16000 Hz, mono, 16-bit PCM)")
 
     st.markdown("---")
+    st.subheader("Segmentation")
+    semantic_segmentation = st.checkbox(
+        "Semantic segmentation",
+        value=st.session_state.get("semantic_segmentation", True),
+        help="When enabled, the Speech service segments the conversation "
+             "semantically. When disabled, the audio is sliced client-side into "
+             "exact fixed-length segments.",
+        disabled=st.session_state.get("running", False),
+    )
+    st.session_state.semantic_segmentation = semantic_segmentation
+    segment_seconds = None
+    if not semantic_segmentation:
+        segment_seconds = st.number_input(
+            "Segment length (seconds)",
+            min_value=1.0,
+            value=float(st.session_state.get("segment_seconds", 10.0)),
+            step=1.0,
+            help="Length of each fixed-time audio segment sent to the LLM.",
+            disabled=st.session_state.get("running", False),
+        )
+        st.session_state.segment_seconds = segment_seconds
+
+    st.markdown("---")
     st.subheader("CSV output")
     csv_filename = st.text_input(
         "CSV file name (optional)",
@@ -362,9 +611,13 @@ if start_clicked and not st.session_state.running and selected_audio:
             st.session_state.csv_writer = None
             st.session_state.csv_path = None
             st.warning(f"Could not open CSV file '{csv_path}': {ex}")
+    # When Semantic segmentation is off, slice the audio into fixed-time segments.
+    interval_seconds = None
+    if not st.session_state.get("semantic_segmentation", True):
+        interval_seconds = float(st.session_state.get("segment_seconds", 10.0))
     worker = threading.Thread(
         target=run_pipeline,
-        args=(aoai_client, st.session_state.event_queue, selected_audio),
+        args=(aoai_client, st.session_state.event_queue, selected_audio, interval_seconds),
         daemon=True,
     )
     worker.start()
@@ -385,11 +638,24 @@ def drain_event_queue():
         except queue.Empty:
             break
         etype = evt.get("type")
-        if etype == "phrase":
-            st.session_state.results.append(evt)
+        if etype == "transcription":
+            # Add the phrase immediately with a pending (None) analysis so the UI
+            # shows the transcription right away.
+            st.session_state.results.append({
+                "id": evt["id"],
+                "text": evt.get("text", ""),
+                "range": evt.get("range"),
+                "analysis": None,
+            })
+        elif etype == "analysis":
+            # Fill in the matching phrase (by id) with the LLM result.
+            analysis = evt.get("analysis") or {}
+            for row in st.session_state.results:
+                if row.get("id") == evt["id"]:
+                    row["analysis"] = analysis
+                    break
             # Write the row to the CSV file (if enabled), skipping failed analyses.
             writer = st.session_state.csv_writer
-            analysis = evt.get("analysis") or {}
             if writer and "error" not in analysis:
                 writer.write_row(evt.get("text", ""), analysis)
         elif etype in ("status", "info"):
@@ -417,10 +683,17 @@ def render_results():
         return
     for i, evt in enumerate(reversed(st.session_state.results), start=1):
         idx = len(st.session_state.results) - i + 1
-        analysis = evt.get("analysis") or {}
+        analysis = evt.get("analysis")
         with st.container(border=True):
-            st.markdown(f"**[{idx}] Transcription:** {evt['text']}")
-            if "error" in analysis:
+            time_range = evt.get("range")
+            label = f"**[{idx}] Transcription:** {evt['text']}"
+            if time_range:
+                label = f"**[{idx}] Transcription** _({time_range})_**:** {evt['text']}"
+            st.markdown(label)
+            if analysis is None:
+                # Transcription is ready but the LLM has not responded yet.
+                st.caption(":hourglass_flowing_sand: Analyzing...")
+            elif "error" in analysis:
                 st.error(f"LLM analysis failed: {analysis['error']}")
             else:
                 cols = st.columns([1, 1, 3, 1]) if SHOW_TIME else st.columns([1, 1, 4])

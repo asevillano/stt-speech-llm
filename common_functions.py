@@ -15,7 +15,9 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import struct
+import subprocess
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +53,13 @@ LANGUAGE = "en-GB"
 DEFAULT_AUDIO_FILE = "customer-support-sample.wav"
 CHUNK_MS = 100  # Duration of each chunk (ms)
 TARGET_SAMPLE_RATE = 16000  # Required by the Speech service (16 kHz, mono, 16-bit PCM)
+
+# Maximum seconds of audio to stream over a single Speech WebSocket connection.
+# Azure Speech closes a connection after ~635 s (10 min 35 s) of total duration,
+# so long audio is streamed over several back-to-back connections, each carrying
+# at most this many seconds (margin left for the final processing of the slice).
+# Configurable via the MAX_CONNECTION_AUDIO_SECONDS env var (handy for testing).
+MAX_CONNECTION_AUDIO_SECONDS = float(os.getenv("MAX_CONNECTION_AUDIO_SECONDS", "540"))
 
 # CSV file (next to this module) holding the intent taxonomy used by the LLM
 # prompts. It has two columns: "intent" and "description". Editing this file is
@@ -283,13 +292,77 @@ class ResultsCsvWriter:
 # --------------------------------------------------------------------------- #
 # Audio conversion
 # --------------------------------------------------------------------------- #
-def load_audio_16k_mono(path):
-    """Reads a WAV file and returns its audio as 16 kHz, mono, 16-bit PCM bytes.
+def _decode_audio_with_ffmpeg(path):
+    """Decodes any audio file ffmpeg understands (mp3, m4a, ...) to 16 kHz mono
+    16-bit PCM bytes. ffmpeg resamples and downmixes in a single pass. Requires
+    ffmpeg on PATH."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "ffmpeg is required to read non-WAV audio files but was not found on "
+            "PATH. Install ffmpeg or provide a 16 kHz mono 16-bit WAV file."
+        )
+    cmd = [
+        ffmpeg, "-v", "error", "-i", path,
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ac", "1", "-ar", str(TARGET_SAMPLE_RATE), "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed to decode {path}: {result.stderr.decode(errors='ignore')}"
+        )
+    return result.stdout
 
-    The Azure Speech service expects 16 kHz / mono / 16-bit PCM. If the source
-    file has a different sample rate, number of channels or sample width, it is
-    converted on the fly so any WAV file can be processed.
+
+def print_audio_info(path):
+    """Prints a short audio-format summary for the given file (WAV via the wave
+    module; other formats are decoded via ffmpeg), plus the format Speech requires."""
+    print("Audio information:")
+    print(f"\tAudio file: {path}")
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".wav":
+            with wave.open(path, "rb") as wf:
+                print(f"\tChannels: {wf.getnchannels()}")
+                print(f"\tSample rate: {wf.getframerate()} Hz")
+                print(f"\tBits per sample: {wf.getsampwidth() * 8}")
+        else:
+            print(f"\tFormat: {ext.lstrip('.') or 'unknown'} (decoded via ffmpeg)")
+    except Exception as ex:
+        print(f"\tCould not read audio header: {ex}")
+    print(f"\tRequired format: 16000 Hz, mono, 16-bit PCM")
+    print()
+
+
+def iter_audio_connection_slices(audio_pcm, max_seconds=None):
+    """Splits 16 kHz mono 16-bit PCM bytes into slices of at most ``max_seconds``
+    each, so every slice can be streamed over its own Speech WebSocket connection
+    (the service closes a connection after ~635 s of total duration).
+
+    Yields ``(index, total, audio_slice)`` tuples, where ``index`` is 1-based and
+    ``total`` is the number of slices. ``max_seconds`` defaults to
+    MAX_CONNECTION_AUDIO_SECONDS."""
+    if max_seconds is None:
+        max_seconds = MAX_CONNECTION_AUDIO_SECONDS
+    bytes_per_second = TARGET_SAMPLE_RATE * 2  # 16-bit mono PCM
+    max_bytes = max(bytes_per_second, int(max_seconds * bytes_per_second))
+    total_bytes = len(audio_pcm)
+    total = max(1, (total_bytes + max_bytes - 1) // max_bytes)
+    for index, offset in enumerate(range(0, total_bytes, max_bytes), start=1):
+        yield index, total, audio_pcm[offset:offset + max_bytes]
+
+
+def load_audio_16k_mono(path):
+    """Reads an audio file and returns its audio as 16 kHz, mono, 16-bit PCM bytes.
+
+    The Azure Speech service expects 16 kHz / mono / 16-bit PCM. WAV files are
+    decoded and converted in-process with numpy. Any other format (mp3, m4a, ...)
+    is decoded with ffmpeg, which must be available on PATH.
     """
+    if os.path.splitext(path)[1].lower() != ".wav":
+        return _decode_audio_with_ffmpeg(path)
+
     with wave.open(path, "rb") as wf:
         channels = wf.getnchannels()
         sample_rate = wf.getframerate()

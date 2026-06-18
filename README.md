@@ -19,7 +19,8 @@ audio .wav → convert to 16 kHz mono 16-bit PCM → WebSocket to Azure Speech
 - **Real-time WebSocket streaming** to the Azure Speech STT service with
   **Semantic segmentation** (`phraseDetection.CONVERSATION.segmentation.mode = "Semantic"`).
 - **On-the-fly audio conversion** of any WAV (stereo / arbitrary sample rate /
-  8-, 16- or 32-bit) to the required **16 kHz mono 16-bit PCM**.
+  8-, 16- or 32-bit) to the required **16 kHz mono 16-bit PCM**. Non-WAV formats
+  (`.mp3`, `.m4a`, ...) are decoded automatically via **ffmpeg** (must be on `PATH`).
 - **Per-phrase LLM analysis**: intent classification (closed list), per-phrase
   sentiment (`positive` / `neutral` / `negative`, evaluated on the latest phrase
   only) and a cumulative conversation summary.
@@ -146,6 +147,7 @@ server processing headers with a client wall-clock fallback.
 | `common_functions.py` | **Central module every script depends on.** Configuration constants, audio conversion, Azure OpenAI client creation / warm-up / phrase analysis, Speech authentication and WebSocket protocol message builders. |
 | `stt-speech-ws-llm.py` | CLI client that streams audio over **WebSocket** and runs LLM analysis per phrase. |
 | `stt-speech-ws-llm-secs.py` | WebSocket CLI variant with **exact fixed-time segments**: optionally slices the audio client-side into precise N-second windows (`--interval`), one recognition turn per segment over a single connection. Without the flag it behaves like `stt-speech-ws-llm.py`. |
+| `stt-speech-ws-llm-banking.py` | **Banking call-center variant**: uses the dedicated intent / sentiment / summary prompts from `banking_prompts/` and always runs the three analyses as parallel calls per phrase. |
 | `stt-speech-llm.py` | CLI client using the **Azure Speech SDK** (`PushAudioInputStream`) with Entra ID auth and Semantic segmentation. |
 | `stt-speech-ws-llm_app.py` | **Streamlit** web UI. The pipeline runs in a dedicated background thread; the UI only reads results from a thread-safe queue. |
 | `intents.csv` | Editable intent taxonomy (`intent,description` columns) loaded at startup and injected into the LLM prompt. |
@@ -160,6 +162,7 @@ server processing headers with a client wall-clock fallback.
 | `common_functions.py` | — | **Shared library imported by every script.** Holds all configuration constants, audio conversion to 16 kHz mono 16-bit PCM, Azure OpenAI client creation / warm-up / `analyze_phrase`, Speech Entra ID authentication, WebSocket protocol message builders, intent loading from `intents.csv` and the CSV results writer. Not meant to be run directly. |
 | `stt-speech-ws-llm.py` | WebSocket | Streams the audio over a raw **WebSocket** to Azure Speech using **Semantic segmentation**, and runs intent + sentiment + summary analysis on every final phrase. The baseline CLI client. |
 | `stt-speech-ws-llm-secs.py` | WebSocket | Same as above plus an optional **exact fixed-time segmentation** mode (`--interval N` / `-i N`): slices the audio client-side into precise N-second windows, one recognition turn per segment over a single connection. Without the flag it behaves like `stt-speech-ws-llm.py`. |
+| `stt-speech-ws-llm-banking.py` | WebSocket | **Banking call-center variant** of `stt-speech-ws-llm.py`. The intent, sentiment and summary prompts come from the JSON payloads in `banking_prompts/`, and for every final phrase the three analyses are **always run as three parallel calls** (each with its own output contract: intent → JSON, sentiment → single word, summary → structured multi-line text). A background worker consumes phrases from a queue so the WebSocket receive loop never blocks on the LLM. |
 | `stt-speech-llm.py` | Speech SDK | Equivalent pipeline built on the **Azure Speech SDK** (`PushAudioInputStream`) instead of a raw WebSocket, with Entra ID auth and Semantic segmentation. |
 | `stt-speech-ws-llm_app.py` | WebSocket | **Streamlit web UI**. Runs the WebSocket pipeline in a dedicated background thread and renders intent / sentiment / summary / latency from a thread-safe queue; includes a sidebar option for CSV output and an intent-descriptions panel. |
 
@@ -172,6 +175,34 @@ server processing headers with a client wall-clock fallback.
 - An **Azure OpenAI** resource with a deployed model (e.g. `gpt-4.1-mini`).
 - Entra ID access (`DefaultAzureCredential`): sign in with `az login`, or use a
   managed identity / service principal with the required Cognitive Services roles.
+- **ffmpeg** on `PATH` — only required to read **non-WAV** audio files (`.mp3`,
+  `.m4a`, ...). Plain `.wav` files are decoded in-process and do not need it.
+
+### Required Azure roles (RBAC)
+
+Authentication uses Entra ID (`DefaultAzureCredential`), so your identity needs
+**data-plane** role assignments — API keys are not used unless `SERVERLESS_MODELS=True`.
+
+| Service | Minimum role | Purpose |
+| --- | --- | --- |
+| Azure OpenAI | **Cognitive Services OpenAI User** | Run inference on already-deployed models (`analyze_phrase`). Does not allow creating the resource or deploying models. |
+| Azure Speech | **Cognitive Services User** | Issue tokens and call the Speech-to-Text service. |
+
+Related roles you may need for management tasks: **Cognitive Services OpenAI
+Contributor** (inference + create model deployments) and **Cognitive Services
+Contributor** (full resource management).
+
+Assign the Azure OpenAI role to your identity (scoped to the resource):
+
+```powershell
+az role assignment create `
+  --assignee "<user-or-appId>" `
+  --role "Cognitive Services OpenAI User" `
+  --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<openai-resource>"
+```
+
+> Role assignments are data-plane permissions for `Authorization: Bearer <token>`
+> calls, not the resource keys. Propagation can take a few minutes.
 
 ## Installation
 
@@ -180,6 +211,20 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+### ffmpeg (only for non-WAV audio)
+
+WAV files are decoded in-process and need nothing extra. To read other formats
+(`.mp3`, `.m4a`, ...) install **ffmpeg** and make sure it is on your `PATH`:
+
+```powershell
+winget install Gyan.FFmpeg        # Windows (winget)
+# or: choco install ffmpeg
+ffmpeg -version                   # verify it is on PATH
+```
+
+If ffmpeg is missing, non-WAV files raise a clear error; convert the file to a
+16 kHz mono 16-bit WAV instead, or install ffmpeg.
 
 ## Configuration
 
@@ -288,6 +333,10 @@ python .\stt-speech-ws-llm-secs.py --interval 5    # exact 5 s segments
 python .\stt-speech-ws-llm-secs.py audio.wav -i 8  # custom audio + 8 s segments
 python .\stt-speech-ws-llm-secs.py -i 10 -o results.csv  # write a CSV
 
+# Banking call-center variant (dedicated prompts, three parallel calls per phrase)
+python .\stt-speech-ws-llm-banking.py [path_to_audio.wav]
+python .\stt-speech-ws-llm-banking.py audio.mp3 --csv results.csv  # mp3 via ffmpeg
+
 # Speech SDK CLI
 python .\stt-speech-llm.py [path_to_audio.wav]
 python .\stt-speech-llm.py audio.wav --csv results.csv      # also write a CSV
@@ -332,6 +381,8 @@ relying on the service segmentation:
 
 1. **Audio conversion** — `load_audio_16k_mono` decodes the WAV, downmixes to mono,
    resamples to 16 kHz with linear interpolation and re-encodes to 16-bit PCM.
+   Non-WAV inputs (`.mp3`, `.m4a`, ...) are decoded and resampled with **ffmpeg**
+   in a single pass (ffmpeg must be available on `PATH`).
 2. **Authentication** — the Speech token uses the format
    `aad#{SPEECH_RESOURCE_ID}#{aadToken}`; the token and Azure OpenAI connection(s)
    are warmed up at start-up.
