@@ -33,3 +33,5 @@ Thumbs.db
 OLD/
 .github/copilot-instructions.md
 audio_samples/
+conversation_gen/
+.gitignore

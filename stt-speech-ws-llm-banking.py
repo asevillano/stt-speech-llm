@@ -92,6 +92,9 @@ def _call_model_raw(client, model, system_prompt, user_prompt):
     because the banking sentiment and summary tasks return plain text rather than JSON.
     Uses the Azure AI Inference chat completions API when SERVERLESS_MODELS is True,
     otherwise the Azure OpenAI Responses API."""
+    if SHOW_DEBUG:
+        print(f"[DEBUG] System prompt:\n{system_prompt}\nUser prompt:\n{user_prompt}\n")
+        print('-' * 50)
     start = time.perf_counter()
     server_s = None
     if SERVERLESS_MODELS:

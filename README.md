@@ -398,6 +398,93 @@ relying on the service segmentation:
    intent is chosen from the taxonomy in `intents.csv`, whose descriptions are part
    of the prompt to improve classification.
 
+---
+
+## Banking variant (`stt-speech-ws-llm-banking.py`)
+
+The banking call-center variant works differently from the baseline scripts in one
+important way: **what is sent to the model**. The transcription still happens in
+real time with Azure Speech, but the analysis is **cumulative for all three tasks**,
+not per-phrase.
+
+### What triggers an analysis
+
+The audio is streamed to Azure Speech over the WebSocket exactly like the baseline
+client (100 ms chunks, Semantic segmentation). Each time the service emits a **final
+phrase** (`speech.phrase` with `RecognitionStatus == 'Success'`), that phrase is
+appended to the running transcript and an analysis is triggered:
+
+```python
+conversation_phrases.append(display_text)            # accumulate the new phrase
+full_conversation = " ".join(conversation_phrases)   # full cumulative transcript
+await analysis_queue.put((display_text, full_conversation))
+```
+
+### What is sent to the model (the key point)
+
+For every final phrase, **three calls (intent, sentiment, summary) are always made
+in parallel**, and all three receive the **same input: the full cumulative
+transcript** (`full_conversation`), never the latest phrase in isolation. The single
+phrase (`display_text`) is used **only** for the console output and the CSV
+`transcription` column — it is not sent to the model on its own.
+
+What makes each task behave differently is its **system prompt**, not its input:
+
+| Task | Input it receives | What the prompt tells it to focus on | Output contract |
+| --- | --- | --- | --- |
+| **Intent** | Full cumulative transcript | The **most recent customer turn** first, using the earlier context only as fallback (`banking_prompts/intent.json`) | JSON with an `Intent` field |
+| **Sentiment** | Full cumulative transcript | The **last sentence the customer spoke** (`banking_prompts/sentiment.json`) | A single word |
+| **Summary** | Full cumulative transcript | The **whole conversation**, summarized cumulatively (`banking_prompts/summary.json`) | Structured multi-line text |
+
+So intent and sentiment are not analyzed on the isolated last phrase: they receive
+the complete conversation so they can disambiguate using prior context, while the
+prompt steers them toward the latest customer turn. The summary is a running summary
+of everything heard so far. This is the main difference from the baseline scripts,
+where sentiment is evaluated on the latest phrase only.
+
+### Why three parallel calls and a background worker
+
+- The three prompts have **separate output contracts** (intent → JSON, sentiment →
+  one word, summary → structured text), so they cannot be merged into one combined
+  JSON call. They are always issued **in parallel** (`ThreadPoolExecutor`), even when
+  the configured endpoints/models are identical, so the per-phrase latency is roughly
+  that of the slowest single call rather than the sum of three.
+- The (multi-second) LLM analysis is **not** run inside the WebSocket receive loop.
+  Each final phrase is handed off to a background `analysis_worker` through an
+  `asyncio.Queue`; the worker runs the analyses **serially, in arrival order**. This
+  keeps the receive loop draining the socket (avoiding the `1011` keepalive-ping
+  timeout) and keeps the console output and CSV rows ordered.
+
+```mermaid
+flowchart TD
+    A["Audio .wav"] -->|100 ms chunks over WebSocket| B["Azure Speech STT<br/>Semantic segmentation"]
+    B -->|speech.phrase final| C["receive_messages<br/>append phrase"]
+    C --> D["conversation_phrases<br/>(cumulative transcript)"]
+    D -->|enqueue| E["analysis_queue"]
+    E --> F["analysis_worker<br/>(serial, in order)"]
+    F --> G{"analyze_phrase_banking<br/>3 parallel calls,<br/>same full transcript"}
+    G -->|focus: latest customer turn| H["Intent → JSON"]
+    G -->|focus: last customer sentence| I["Sentiment → word"]
+    G -->|focus: whole call| J["Summary → text"]
+    H --> K["Console + optional CSV"]
+    I --> K
+    J --> K
+```
+
+### Prompt files
+
+The prompts live in `banking_prompts/`. The variant loads the **system** messages of
+each payload as-is and replaces the user message with the live transcript:
+
+- `intent.json`, `sentiment.json`, `summary.json` — the baseline banking prompts.
+- `intent-gpt5.json`, `sentiment-gpt5.json`, `summary-gpt5.json` — the same tasks
+  rewritten following `gpt-5.x` prompting best practices.
+
+The `intent.json` payload also carries a second system message with the
+`INTENT_LIBRARY` (a `Product → {Service: [Actions]}` taxonomy); the model must return
+an `Intent` in the strict `Product_Service_Action` format, preferring a library match
+over inventing a new one.
+
 ### Streamlit latency pattern
 
 The full pipeline (WebSocket + recognition + Azure OpenAI calls) runs in a
