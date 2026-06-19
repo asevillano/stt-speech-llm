@@ -24,6 +24,12 @@ audio .wav → convert to 16 kHz mono 16-bit PCM → WebSocket to Azure Speech
 - **Per-phrase LLM analysis**: intent classification (closed list), per-phrase
   sentiment (`positive` / `neutral` / `negative`, evaluated on the latest phrase
   only) and a cumulative conversation summary.
+- **Incremental summary mode** (`INCREMENTAL_SUMMARY`): instead of re-summarizing
+  the whole transcript on every phrase, the running summary is built from the
+  *previous summary* plus the *latest phrase* only, keeping the summary call's input
+  small and its latency flat on long calls. An optional periodic full refresh
+  (`SUMMARY_REFRESH_EVERY`, every Nth phrase) recovers detail lost to incremental
+  drift; `0` disables it (pure incremental).
 - **Editable intent taxonomy**: intents and their descriptions live in `intents.csv`,
   loaded at startup and injected into the prompt to improve classification — no code
   changes needed to add, remove or refine intents.
@@ -138,6 +144,25 @@ sentiment are always evaluated on the **latest phrase only**, while the summary 
 maintained cumulatively over the full transcript. Latency is reported from the
 server processing headers with a client wall-clock fallback.
 
+### Summary strategies
+
+The running summary can be produced in two ways, selected with `INCREMENTAL_SUMMARY`:
+
+| | Full re-summary (`INCREMENTAL_SUMMARY=False`, default) | Incremental (`INCREMENTAL_SUMMARY=True`) |
+| --- | --- | --- |
+| Summary input | The **whole transcript** on every phrase | The **previous summary** + the **latest phrase** only |
+| Latency on long calls | Grows with the transcript | Small and roughly **flat** (bounded input) |
+| LLM call | Combined with intent when they share endpoint/model | **Always a separate parallel call** (option B) |
+| Periodic full refresh | n/a | Every `SUMMARY_REFRESH_EVERY` phrases (set `0` to disable) |
+
+With incremental mode on, intent and sentiment still use the full transcript, so the
+summary is issued as its own parallel call even when intent and summary share the
+same endpoint/model. Every `SUMMARY_REFRESH_EVERY`th phrase the summary is
+regenerated from the whole transcript to recover any detail lost to incremental
+drift. Both flags are read from the environment by `common_functions.py`
+(`should_refresh_summary` / `analyze_phrase`) and can also be set live from the
+Streamlit sidebar.
+
 ---
 
 ## Key files
@@ -165,7 +190,7 @@ server processing headers with a client wall-clock fallback.
 | `stt-speech-ws-llm-secs.py` | WebSocket | Same as above plus an optional **exact fixed-time segmentation** mode (`--interval N` / `-i N`): slices the audio client-side into precise N-second windows, one recognition turn per segment over a single connection. Without the flag it behaves like `stt-speech-ws-llm.py`. |
 | `stt-speech-ws-llm-banking.py` | WebSocket | **Banking call-center variant** of `stt-speech-ws-llm.py`. The intent, sentiment and summary prompts come from the JSON payloads in `banking_prompts/`, and for every final phrase the three analyses are **always run as three parallel calls** (each with its own output contract: intent → JSON, sentiment → single word, summary → structured multi-line text). A background worker consumes phrases from a queue so the WebSocket receive loop never blocks on the LLM. |
 | `stt-speech-llm.py` | Speech SDK | Equivalent pipeline built on the **Azure Speech SDK** (`PushAudioInputStream`) instead of a raw WebSocket, with Entra ID auth and Semantic segmentation. |
-| `stt-speech-ws-llm_app.py` | WebSocket | **Streamlit web UI**. Runs the WebSocket pipeline in a dedicated background thread and renders intent / sentiment / summary / latency from a thread-safe queue; includes a sidebar option for CSV output and an intent-descriptions panel. |
+| `stt-speech-ws-llm_app.py` | WebSocket | **Streamlit web UI**. Runs the WebSocket pipeline in a dedicated background thread and renders intent / sentiment / summary / latency from a thread-safe queue; the sidebar exposes segmentation, **summary strategy** (incremental summary + optional periodic refresh), CSV output and an intent-descriptions panel, and a **Start / Stop** button drives the run. |
 
 ---
 
@@ -252,6 +277,14 @@ AZURE_OPENAI_SUMMARY_MODEL=gpt-4.1-mini
 # Use open models via Azure AI Inference (chat completions) instead of Azure OpenAI.
 SERVERLESS_MODELS=False
 
+# Summary strategy. INCREMENTAL_SUMMARY=True builds the summary from the previous
+# summary + the latest phrase only (flat latency on long calls) and always issues
+# the summary as a separate parallel call. SUMMARY_REFRESH_EVERY regenerates the
+# summary from the whole transcript every Nth phrase (0 disables the refresh; only
+# applies when INCREMENTAL_SUMMARY=True).
+INCREMENTAL_SUMMARY=False
+SUMMARY_REFRESH_EVERY=10
+
 # API keys used ONLY when SERVERLESS_MODELS=True (otherwise Entra ID is used).
 AZURE_OPENAI_INTENT_KEY=<key>
 AZURE_OPENAI_SUMMARY_KEY=<key>
@@ -263,7 +296,8 @@ AZURE_OPENAI_SUMMARY_KEY=<key>
 Additional behavior is controlled by constants in `common_functions.py`:
 `LANGUAGE` (e.g. `en-GB` / `es-ES`), `DEFAULT_AUDIO_FILE`, `CHUNK_MS` (100 ms),
 `TARGET_SAMPLE_RATE` (16000), the display flags (`SHOW_INFO`, `SHOW_PARTIAL`,
-`SHOW_TIME`, `SHOW_DEBUG`) and the `SENTIMENTS` list.
+`SHOW_TIME`, `SHOW_DEBUG`), the `SENTIMENTS` list and the summary-strategy flags
+`INCREMENTAL_SUMMARY` / `SUMMARY_REFRESH_EVERY` (both overridable via `.env`).
 
 The **intent taxonomy** is defined in `intents.csv` (columns `intent,description`).
 It is read at startup, the names populate `INTENTS` and the descriptions are
@@ -492,6 +526,25 @@ The full pipeline (WebSocket + recognition + Azure OpenAI calls) runs in a
 from a `queue.Queue` and renders them in an `st.fragment(run_every=0.5)` that
 auto-refreshes **without** re-running the whole script — keeping UI work off the
 worker's critical path so measured LLM latency stays accurate.
+
+### Streamlit sidebar and controls
+
+The Streamlit app (`stt-speech-ws-llm_app.py`) exposes the run options in the sidebar:
+
+- **Segmentation** — Semantic (per-phrase) or exact fixed-time segments.
+- **Summary** — an **Incremental summary** checkbox (defaults to `INCREMENTAL_SUMMARY`);
+  when enabled, a **Regenerate full summary periodically** checkbox appears, and when
+  that is on, a **Regenerate every N phrases** field (default `10`) sets the refresh
+  cadence. These map to `cf.INCREMENTAL_SUMMARY` and `cf.SUMMARY_REFRESH_EVERY`, which
+  are applied to the worker at start (refresh `0` when periodic regeneration is off).
+- **CSV output** — a filename field; relative names are saved next to the app.
+- **Intent descriptions** — a read-only panel of the loaded `intents.csv` taxonomy.
+
+A single **Start / Stop** toggle button drives the run: **red** "Start transcription"
+when idle, and once a run is launched it turns **grey** "Stop transcription". Pressing
+it while running sets a `threading.Event` the worker polls (raising an internal
+`_StopRequested`) to interrupt streaming early, emits a *Stopped by user* status and
+returns the button to its idle red state.
 
 ---
 

@@ -116,19 +116,26 @@ async def analysis_worker(analysis_queue):
 
     A None item is the sentinel that tells the worker to stop once the queue has
     been fully drained."""
+    # Running summary kept across phrases so INCREMENTAL_SUMMARY can build the next
+    # summary from the previous one plus the latest phrase (ignored otherwise).
+    previous_summary = ""
+    turn_index = 0  # 1-based phrase count, drives periodic full summary refresh
     while True:
         item = await analysis_queue.get()
         try:
             if item is None:
                 return
             display_text, full_conversation = item
+            turn_index += 1
             print("-" * 50)
             print(f"[TRANSCRIPTION] {display_text}")
             # Run the (blocking) LLM call without blocking the event loop
             analysis = await asyncio.to_thread(
-                analyze_phrase, aoai_clients, display_text, full_conversation
+                analyze_phrase, aoai_clients, display_text, full_conversation,
+                previous_summary, turn_index
             )
             if analysis and "error" not in analysis:
+                previous_summary = analysis.get('summary', previous_summary)
                 print(f"[INTENT] {analysis.get('intent', 'unknown')}")
                 print(f"[SENTIMENT] {analysis.get('sentiment', 'unknown')}")
                 print(f"[SUMMARY] {analysis.get('summary', '')}")

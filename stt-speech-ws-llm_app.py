@@ -25,12 +25,14 @@ import threading
 
 import streamlit as st
 
+import common_functions as cf
 from common_functions import (
     SPEECH_REGION, LANGUAGE, CHUNK_MS, TARGET_SAMPLE_RATE,
     SHOW_INFO, SHOW_PARTIAL, SHOW_TIME, INTENTS, INTENT_DESCRIPTIONS, WS_URL,
     AOAI_INTENT_MODEL, AOAI_SUMMARY_MODEL, USE_SEPARATE_INTENT_SUMMARY,
     AOAI_INTENT_ENDPOINT, AOAI_SUMMARY_ENDPOINT,
     DEFAULT_AUDIO_FILE, MAX_CONNECTION_AUDIO_SECONDS,
+    INCREMENTAL_SUMMARY, SUMMARY_REFRESH_EVERY,
     load_audio_16k_mono, describe_audio,
     create_aoai_clients, warmup_aoai, analyze_phrase,
     get_auth_token, create_speech_config_message,
@@ -63,6 +65,10 @@ def get_aoai_client():
     # pay the token round-trip before the WebSocket connection.
     warmup_speech_token()
     return clients
+
+
+class _StopRequested(Exception):
+    """Raised inside the worker when the UI asks to stop transcription early."""
 
 
 async def receive_messages(ws, aoai_client, event_queue, state):
@@ -111,8 +117,13 @@ async def receive_messages(ws, aoai_client, event_queue, state):
                                 })
                                 # Run the (blocking) LLM call without blocking the event loop
                                 analysis = await asyncio.to_thread(
-                                    analyze_phrase, aoai_client, display_text, full_conversation
+                                    analyze_phrase, aoai_client, display_text,
+                                    full_conversation, state["previous_summary"], phrase_id
                                 )
+                                if analysis and "error" not in analysis:
+                                    state["previous_summary"] = analysis.get(
+                                        "summary", state["previous_summary"]
+                                    )
                                 # Emit the analysis as a follow-up event correlated
                                 # by id, so the UI fills in the matching phrase.
                                 event_queue.put({
@@ -192,7 +203,7 @@ async def receive_segment(ws, event_queue):
     return phrases
 
 
-async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=None):
+async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=None, stop_event=None):
     """Connects to Azure Speech Service over WebSocket, streams the audio in
     real time and drives the receive/analysis loop.
 
@@ -201,17 +212,25 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
     audio is sliced client-side into exact N-second segments, each sent as its own
     recognition turn, and analyzed once fully transcribed.
 
+    ``stop_event`` is a threading.Event the UI sets to request an early stop; it is
+    checked while pacing the audio so the worker exits promptly and cleanly.
+
     Azure Speech closes a connection after ~635 s of total duration, so long audio
     is streamed over several back-to-back connections; the running conversation and
     phrase ids are shared across them so the LLM context and the UI ids stay
     coherent."""
+    def _check_stop():
+        """Raises _StopRequested when the UI has asked the worker to stop."""
+        if stop_event is not None and stop_event.is_set():
+            raise _StopRequested()
+
     # Pre-load and convert the audio once so it can be streamed in chunks.
     audio_pcm = load_audio_16k_mono(audio_file)
     # Bytes per chunk: 16-bit (2 bytes) * TARGET_SAMPLE_RATE * CHUNK_MS
     bytes_per_chunk = int(TARGET_SAMPLE_RATE * (CHUNK_MS / 1000.0)) * 2
 
     # Shared state across all connections (LLM context + monotonic phrase id).
-    state = {"conversation_phrases": [], "phrase_id": 0}
+    state = {"conversation_phrases": [], "phrase_id": 0, "previous_summary": ""}
 
     if interval_seconds is None:
         # ----------------------- SEMANTIC MODE (default) -----------------------
@@ -259,6 +278,7 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
                     # resuming from the last byte sent on previous attempts.
                     event_queue.put({"type": "status", "text": "Streaming audio in real time..."})
                     for offset in range(sent_offset, len(audio_slice), bytes_per_chunk):
+                        _check_stop()
                         data = audio_slice[offset:offset + bytes_per_chunk]
                         if not data:
                             break
@@ -337,6 +357,7 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
         event_queue.put({"type": "status", "text": "Streaming audio in real time..."})
         try:
             for seg_start in seg_starts:
+                _check_stop()
                 seg_end = min(seg_start + bytes_per_segment, total_bytes)
                 start_s = seg_start * seconds_per_byte
                 end_s = seg_end * seconds_per_byte
@@ -357,6 +378,7 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
                     try:
                         # Stream this segment's audio chunks, paced for real time.
                         for offset in range(seg_start, seg_end, bytes_per_chunk):
+                            _check_stop()
                             data = audio_pcm[offset:min(offset + bytes_per_chunk, seg_end)]
                             if not data:
                                 break
@@ -396,8 +418,13 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
                     })
                     # Run the (blocking) LLM call without blocking the event loop.
                     analysis = await asyncio.to_thread(
-                        analyze_phrase, aoai_client, segment_text, full_conversation
+                        analyze_phrase, aoai_client, segment_text,
+                        full_conversation, state["previous_summary"], phrase_id
                     )
+                    if analysis and "error" not in analysis:
+                        state["previous_summary"] = analysis.get(
+                            "summary", state["previous_summary"]
+                        )
                     event_queue.put({
                         "type": "analysis",
                         "id": phrase_id,
@@ -410,11 +437,14 @@ async def stream_audio(aoai_client, event_queue, audio_file, interval_seconds=No
     event_queue.put({"type": "status", "text": "Process completed"})
 
 
-def run_pipeline(aoai_client, event_queue, audio_file, interval_seconds=None):
+def run_pipeline(aoai_client, event_queue, audio_file, interval_seconds=None, stop_event=None):
     """Worker entry point: runs the asyncio pipeline in its own thread with its
     own event loop, fully decoupled from Streamlit's rerun loop."""
     try:
-        asyncio.run(stream_audio(aoai_client, event_queue, audio_file, interval_seconds))
+        asyncio.run(stream_audio(aoai_client, event_queue, audio_file,
+                                 interval_seconds, stop_event))
+    except _StopRequested:
+        event_queue.put({"type": "status", "text": "Stopped by user"})
     except Exception as e:
         event_queue.put({"type": "error", "text": str(e)})
     finally:
@@ -529,6 +559,38 @@ with st.sidebar:
         st.session_state.segment_seconds = segment_seconds
 
     st.markdown("---")
+    st.subheader("Summary")
+    incremental_summary = st.checkbox(
+        "Incremental summary",
+        value=st.session_state.get("incremental_summary", INCREMENTAL_SUMMARY),
+        help="When enabled, the running summary is built from the previous summary "
+             "plus the latest phrase (bounded input, lower latency on long calls). "
+             "When disabled, the whole transcript is re-summarized on every phrase.",
+        disabled=st.session_state.get("running", False),
+    )
+    st.session_state.incremental_summary = incremental_summary
+    summary_refresh_every = 0
+    if incremental_summary:
+        regenerate = st.checkbox(
+            "Regenerate full summary periodically",
+            value=st.session_state.get("summary_regenerate", SUMMARY_REFRESH_EVERY > 0),
+            help="Every N phrases, regenerate the summary from the whole transcript "
+                 "to recover detail lost to incremental drift.",
+            disabled=st.session_state.get("running", False),
+        )
+        st.session_state.summary_regenerate = regenerate
+        if regenerate:
+            summary_refresh_every = int(st.number_input(
+                "Regenerate every N phrases",
+                min_value=1,
+                value=int(st.session_state.get("summary_refresh_every", SUMMARY_REFRESH_EVERY) or 10),
+                step=1,
+                help="Number of phrases between full re-summaries.",
+                disabled=st.session_state.get("running", False),
+            ))
+            st.session_state.summary_refresh_every = summary_refresh_every
+
+    st.markdown("---")
     st.subheader("CSV output")
     csv_filename = st.text_input(
         "CSV file name (optional)",
@@ -569,11 +631,56 @@ if "csv_writer" not in st.session_state:
     st.session_state.csv_writer = None
 if "csv_path" not in st.session_state:
     st.session_state.csv_path = None
+if "stop_event" not in st.session_state:
+    st.session_state.stop_event = None
+
+running = st.session_state.running
+
+# Toggle button colours: red background / white text when idle ("Start"); grey
+# background / black text when running ("Stop"). The button is keyed so the CSS
+# can target its wrapper (Streamlit adds a .st-key-<key> class to it).
+toggle_color_css = (
+    """
+    <style>
+    div.st-key-startstop_btn button {
+        background-color: #9e9e9e !important;
+        color: #000000 !important;
+        border-color: #9e9e9e !important;
+    }
+    </style>
+    """
+    if running else
+    """
+    <style>
+    div.st-key-startstop_btn button {
+        background-color: #e60000 !important;
+        color: #ffffff !important;
+        border-color: #e60000 !important;
+    }
+    </style>
+    """
+)
+st.markdown(toggle_color_css, unsafe_allow_html=True)
 
 col_start, col_reset = st.columns(2)
-start_clicked = col_start.button("Start transcription", type="primary",
-                                 disabled=st.session_state.running or not selected_audio)
-reset_clicked = col_reset.button("Reset", disabled=st.session_state.running)
+toggle_label = "Stop transcription" if running else "Start transcription"
+toggle_clicked = col_start.button(
+    toggle_label, key="startstop_btn",
+    disabled=(not running and not selected_audio),
+)
+reset_clicked = col_reset.button("Reset", disabled=running)
+
+start_clicked = False
+if toggle_clicked:
+    if running:
+        # Ask the worker to stop; it checks the event while pacing the audio and
+        # exits cleanly, emitting 'done' which flips 'running' back to False.
+        if st.session_state.get("stop_event") is not None:
+            st.session_state.stop_event.set()
+        st.session_state.status = "Stopping..."
+        st.rerun()
+    else:
+        start_clicked = True
 
 if reset_clicked:
     if st.session_state.csv_writer:
@@ -585,6 +692,7 @@ if reset_clicked:
     st.session_state.finished = False
     st.session_state.event_queue = None
     st.session_state.worker = None
+    st.session_state.stop_event = None
     st.rerun()
 
 if start_clicked and not st.session_state.running and selected_audio:
@@ -594,6 +702,8 @@ if start_clicked and not st.session_state.running and selected_audio:
     st.session_state.finished = False
     st.session_state.status = f"Starting... ({os.path.basename(selected_audio)})"
     st.session_state.event_queue = queue.Queue()
+    stop_event = threading.Event()
+    st.session_state.stop_event = stop_event
     # Open the CSV results file (if a name was provided). Relative names are saved
     # next to the app. The writer lives in session_state so the segment counter
     # survives reruns; rows are written by the UI thread while draining events.
@@ -615,14 +725,28 @@ if start_clicked and not st.session_state.running and selected_audio:
     interval_seconds = None
     if not st.session_state.get("semantic_segmentation", True):
         interval_seconds = float(st.session_state.get("segment_seconds", 10.0))
+    # Apply the summary options chosen in the sidebar so the worker's analyze_phrase
+    # (which reads these module-level globals) uses them for this run.
+    cf.INCREMENTAL_SUMMARY = bool(st.session_state.get("incremental_summary", INCREMENTAL_SUMMARY))
+    cf.SUMMARY_REFRESH_EVERY = (
+        int(st.session_state.get("summary_refresh_every", SUMMARY_REFRESH_EVERY))
+        if st.session_state.get("incremental_summary", INCREMENTAL_SUMMARY)
+        and st.session_state.get("summary_regenerate", SUMMARY_REFRESH_EVERY > 0)
+        else 0
+    )
     worker = threading.Thread(
         target=run_pipeline,
-        args=(aoai_client, st.session_state.event_queue, selected_audio, interval_seconds),
+        args=(aoai_client, st.session_state.event_queue, selected_audio,
+              interval_seconds, stop_event),
         daemon=True,
     )
     worker.start()
     st.session_state.worker = worker
     st.session_state.running = True
+    # Rerun immediately so the toggle button re-renders as "Stop transcription"
+    # (grey). The button is outside the auto-refreshing fragment, so without this
+    # rerun it would keep showing "Start transcription" until the next interaction.
+    st.rerun()
 
 # Drain any events produced by the background worker (non-blocking).
 def drain_event_queue():

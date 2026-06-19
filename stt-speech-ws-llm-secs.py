@@ -116,12 +116,16 @@ else:
 print()
 
 
-async def run_analysis(latest_phrase, full_conversation):
+async def run_analysis(latest_phrase, full_conversation, previous_summary="", turn_index=None):
     """Runs the (blocking) LLM call off the event loop and prints the result.
 
-    Shared by both the immediate and the windowed modes."""
+    Shared by both the immediate and the windowed modes. Returns the (possibly
+    updated) running summary so the caller can feed it back on the next phrase when
+    INCREMENTAL_SUMMARY is enabled. 'turn_index' (1-based phrase count) drives the
+    periodic full summary refresh."""
     analysis = await asyncio.to_thread(
-        analyze_phrase, aoai_clients, latest_phrase, full_conversation
+        analyze_phrase, aoai_clients, latest_phrase, full_conversation,
+        previous_summary, turn_index
     )
     if analysis and "error" not in analysis:
         print(f"[INTENT] {analysis.get('intent', 'unknown')}")
@@ -136,8 +140,10 @@ async def run_analysis(latest_phrase, full_conversation):
                 print(f"[TIME] Text model call: {client_s:.3f} s")
         if csv_writer:
             csv_writer.write_row(latest_phrase, analysis)
+        return analysis.get('summary', previous_summary)
     elif analysis and "error" in analysis:
         print(f"[ERROR] LLM analysis failed: {analysis['error']}")
+    return previous_summary
 
 
 def _parse_message(message):
@@ -204,15 +210,21 @@ async def analysis_worker(analysis_queue):
     phrase at a time, in arrival order, so the console output and CSV rows stay
     ordered even though the receive loop never waits for the (multi-second) LLM
     call. A None item is the sentinel that stops the worker once drained."""
+    # Running summary kept across phrases for INCREMENTAL_SUMMARY (ignored otherwise).
+    previous_summary = ""
+    turn_index = 0  # 1-based phrase count, drives periodic full summary refresh
     while True:
         item = await analysis_queue.get()
         try:
             if item is None:
                 return
             latest_phrase, full_conversation = item
+            turn_index += 1
             print("-" * 50)
             print(f"[TRANSCRIPTION] {latest_phrase}")
-            await run_analysis(latest_phrase, full_conversation)
+            previous_summary = await run_analysis(
+                latest_phrase, full_conversation, previous_summary, turn_index
+            )
         finally:
             analysis_queue.task_done()
 
@@ -393,7 +405,11 @@ async def stream_segments(state):
             if segment_text:
                 state["conversation_phrases"].append(segment_text)
                 full_conversation = " ".join(state["conversation_phrases"])
-                await run_analysis(segment_text, full_conversation)
+                state["turn_index"] += 1
+                state["previous_summary"] = await run_analysis(
+                    segment_text, full_conversation,
+                    state["previous_summary"], state["turn_index"]
+                )
             seg_count += 1
     finally:
         await close_connection()
@@ -406,6 +422,8 @@ async def stream_audio():
     # reconnections.
     state = {
         "conversation_phrases": [],  # all phrases/segments so far (LLM context)
+        "previous_summary": "",      # running summary for INCREMENTAL_SUMMARY mode
+        "turn_index": 0,             # 1-based phrase count, drives summary refresh
     }
 
     print("[STARTUP] Starting streaming audio in Real-Time\n")

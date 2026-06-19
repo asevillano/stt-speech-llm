@@ -25,7 +25,7 @@ import websockets
 from common_functions import (
     SPEECH_REGION, LANGUAGE, CHUNK_MS, TARGET_SAMPLE_RATE,
     SHOW_TIME, SHOW_DEBUG, WS_URL,
-    SERVERLESS_MODELS,
+    SERVERLESS_MODELS, INCREMENTAL_SUMMARY, should_refresh_summary,
     AOAI_INTENT_ENDPOINT, AOAI_INTENT_MODEL,
     AOAI_SUMMARY_ENDPOINT, AOAI_SUMMARY_MODEL,
     print_info, print_partial, parse_audio_file_arg,
@@ -69,6 +69,12 @@ def _load_system_prompt(filename):
 INTENT_SYSTEM_PROMPT = _load_system_prompt("intent.json")
 SENTIMENT_SYSTEM_PROMPT = _load_system_prompt("sentiment.json")
 SUMMARY_SYSTEM_PROMPT = _load_system_prompt("summary.json")
+# Incremental summary prompt (used only when INCREMENTAL_SUMMARY is True): updates
+# the previous structured summary with the latest phrase instead of re-reading the
+# whole transcript. Loaded lazily so the file is only required in incremental mode.
+SUMMARY_INCREMENTAL_SYSTEM_PROMPT = (
+    _load_system_prompt("summary-incremental.json") if INCREMENTAL_SUMMARY else ""
+)
 
 
 def _build_user_prompt(full_conversation):
@@ -79,6 +85,20 @@ def _build_user_prompt(full_conversation):
         "<transcript>\n"
         f"''' {full_conversation} '''\n"
         "</transcript>"
+    )
+
+
+def _build_summary_user_prompt(latest_phrase, previous_summary):
+    """User message for the incremental summary: the previous summary plus the
+    latest phrase, instead of the full transcript."""
+    return (
+        "INPUT\n"
+        "<previous_summary>\n"
+        f"''' {previous_summary} '''\n"
+        "</previous_summary>\n"
+        "<latest_phrase>\n"
+        f"''' {latest_phrase} '''\n"
+        "</latest_phrase>"
     )
 
 
@@ -149,32 +169,51 @@ def _parse_sentiment(raw):
     return text.split()[0] if text else "Neutral"
 
 
-def analyze_phrase_banking(clients, full_conversation):
+def analyze_phrase_banking(clients, full_conversation, latest_phrase="", previous_summary="", turn_index=None):
     """Runs the banking intent, sentiment and summary prompts ALWAYS as three parallel
     calls (even when the configured endpoints/models are identical).
+
+    Intent and sentiment always receive the full transcript. When INCREMENTAL_SUMMARY
+    is True the summary task instead receives the previous summary plus the latest
+    phrase (option B), so the caller must feed the returned 'summary' back as
+    'previous_summary' on the next phrase and pass 'turn_index' (1-based phrase count)
+    so that every SUMMARY_REFRESH_EVERY phrases the summary is regenerated from the
+    whole transcript to counter incremental drift.
 
     Returns a dict with 'intent', 'sentiment', 'summary' and timing keys, or
     {'error': ...} on failure."""
     user_prompt = _build_user_prompt(full_conversation)
+    # The summary task either re-summarizes the whole transcript (default, or on a
+    # periodic full refresh) or updates the previous summary with the latest phrase.
+    incremental = INCREMENTAL_SUMMARY and not should_refresh_summary(turn_index)
+    if incremental:
+        summary_system_prompt = SUMMARY_INCREMENTAL_SYSTEM_PROMPT
+        summary_user_prompt = _build_summary_user_prompt(latest_phrase, previous_summary)
+    else:
+        summary_system_prompt = SUMMARY_SYSTEM_PROMPT
+        summary_user_prompt = user_prompt
     # Route the three tasks to the configured clients/models. Intent and sentiment
     # use the intent endpoint/model; summary uses the summary endpoint/model. When
     # the configuration points them all to the same place, three independent calls
-    # are still issued in parallel.
+    # are still issued in parallel. The last tuple element is the per-task user prompt.
     tasks = [
-        ("intent", clients["intent"], AOAI_INTENT_MODEL, INTENT_SYSTEM_PROMPT, AOAI_INTENT_ENDPOINT),
-        ("sentiment", clients["intent"], AOAI_INTENT_MODEL, SENTIMENT_SYSTEM_PROMPT, AOAI_INTENT_ENDPOINT),
-        ("summary", clients["summary"], AOAI_SUMMARY_MODEL, SUMMARY_SYSTEM_PROMPT, AOAI_SUMMARY_ENDPOINT),
+        ("intent", clients["intent"], AOAI_INTENT_MODEL, INTENT_SYSTEM_PROMPT, user_prompt),
+        ("sentiment", clients["intent"], AOAI_INTENT_MODEL, SENTIMENT_SYSTEM_PROMPT, user_prompt),
+        ("summary", clients["summary"], AOAI_SUMMARY_MODEL, summary_system_prompt, summary_user_prompt),
     ]
     if SHOW_DEBUG:
+        summary_mode = ("incremental" if incremental
+                        else ("full refresh" if INCREMENTAL_SUMMARY else "full"))
         print(f"[DEBUG] Calling intent '{AOAI_INTENT_MODEL}' @ {AOAI_INTENT_ENDPOINT}, "
               f"sentiment '{AOAI_INTENT_MODEL}' @ {AOAI_INTENT_ENDPOINT} and "
-              f"summary '{AOAI_SUMMARY_MODEL}' @ {AOAI_SUMMARY_ENDPOINT} in parallel")
+              f"summary '{AOAI_SUMMARY_MODEL}' @ {AOAI_SUMMARY_ENDPOINT} in parallel "
+              f"[summary: {summary_mode}]")
     try:
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
-                name: executor.submit(_call_model_raw, client, model, system_prompt, user_prompt)
-                for name, client, model, system_prompt, _ in tasks
+                name: executor.submit(_call_model_raw, client, model, system_prompt, task_user_prompt)
+                for name, client, model, system_prompt, task_user_prompt in tasks
             }
             intent_raw, intent_elapsed, intent_server = futures["intent"].result()
             sentiment_raw, sentiment_elapsed, sentiment_server = futures["sentiment"].result()
@@ -294,6 +333,9 @@ async def analysis_worker(analysis_queue):
 
     A None item is the sentinel that tells the worker to stop once the queue has
     been fully drained."""
+    # Running summary kept across phrases for INCREMENTAL_SUMMARY (ignored otherwise).
+    previous_summary = ""
+    turn_index = 0  # 1-based phrase count, drives periodic full summary refresh
     while True:
         item = await analysis_queue.get()
         try:
@@ -302,11 +344,14 @@ async def analysis_worker(analysis_queue):
             display_text, full_conversation = item
             print("-" * 50)
             print(f"[TRANSCRIPTION] {display_text}")
+            turn_index += 1
             # Run the (blocking) LLM calls without blocking the event loop.
             analysis = await asyncio.to_thread(
-                analyze_phrase_banking, aoai_clients, full_conversation
+                analyze_phrase_banking, aoai_clients, full_conversation,
+                display_text, previous_summary, turn_index
             )
             if analysis and "error" not in analysis:
+                previous_summary = analysis.get('summary', previous_summary)
                 print(f"[INTENT] {analysis.get('intent', 'unknown')}")
                 print(f"[SENTIMENT] {analysis.get('sentiment', 'unknown')}")
                 print(f"[SUMMARY]\n{analysis.get('summary', '')}")

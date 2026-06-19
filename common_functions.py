@@ -82,6 +82,20 @@ AOAI_API_VERSION = "2025-04-01-preview"
 # key when provided, otherwise Entra ID (DefaultAzureCredential).
 SERVERLESS_MODELS = _env_bool("SERVERLESS_MODELS", False)
 
+# When INCREMENTAL_SUMMARY is True the running summary is built from the PREVIOUS
+# summary plus the LATEST phrase only, instead of re-summarizing the whole
+# transcript on every phrase. This keeps the summary call's input small and bounded
+# (lower, flat latency on long calls). Intent and sentiment still use the full
+# transcript, so with this flag on the summary is ALWAYS issued as a separate
+# parallel call (option B), even when intent and summary share endpoint/model.
+INCREMENTAL_SUMMARY = _env_bool("INCREMENTAL_SUMMARY", False)
+
+# Number of phrases between full re-summaries when INCREMENTAL_SUMMARY is True. Every
+# Nth phrase the summary is regenerated from the WHOLE transcript instead of from the
+# previous summary, to recover detail lost to incremental drift. Set to 0 to disable
+# (pure incremental, never refresh). Has no effect when INCREMENTAL_SUMMARY is False.
+SUMMARY_REFRESH_EVERY = int(os.getenv("SUMMARY_REFRESH_EVERY", "10"))
+
 # Endpoint/model for intent detection and for summary generation. The intent
 # variables are required; the summary ones default to the intent values, so a
 # single service can be configured with just AZURE_OPENAI_INTENT_*.
@@ -189,6 +203,22 @@ SUMMARY_SYSTEM_PROMPT = (
     "verbatim, and do NOT simply concatenate the phrases.\n"
     "Respond ONLY with a valid JSON object with exactly this key: "
     '{"summary": "<concise summary>"}.'
+)
+
+# Incremental summary prompt (used when INCREMENTAL_SUMMARY is True). Instead of the
+# whole transcript, the model receives the PREVIOUS summary plus the LATEST phrase
+# and updates the summary, so the input stays small and bounded on long calls.
+SUMMARY_INCREMENTAL_SYSTEM_PROMPT = (
+    "You are an assistant that maintains a running summary of a customer support "
+    "phone call.\n"
+    "You are given the PREVIOUS summary (it may be empty at the start of the call) "
+    "and the LATEST phrase. Update the summary so it still CONDENSES and PARAPHRASES "
+    "the key points (who is calling, the issue, and what is being requested) in 1-2 "
+    "sentences, incorporating the latest phrase. If the previous summary is empty, "
+    "summarize just the latest phrase. Do NOT copy the phrase verbatim and do NOT "
+    "simply append it to the previous summary.\n"
+    "Respond ONLY with a valid JSON object with exactly this key: "
+    '{"summary": "<concise updated summary>"}.'
 )
 
 # WebSocket service URL
@@ -511,6 +541,28 @@ def _build_user_prompt(latest_phrase, full_conversation):
     )
 
 
+def _build_summary_user_prompt(latest_phrase, previous_summary):
+    """User prompt for the incremental summary: the previous summary plus the latest
+    phrase, instead of the full transcript."""
+    return (
+        f"Previous summary: \"{previous_summary}\"\n\n"
+        f"Latest phrase: \"{latest_phrase}\""
+    )
+
+
+def should_refresh_summary(turn_index):
+    """Returns True when the running summary should be regenerated from the WHOLE
+    transcript on this phrase, instead of incrementally. Only relevant in incremental
+    mode; driven by SUMMARY_REFRESH_EVERY (0 disables refresh). 'turn_index' is the
+    1-based count of analyzed phrases."""
+    return (
+        INCREMENTAL_SUMMARY
+        and SUMMARY_REFRESH_EVERY > 0
+        and turn_index is not None
+        and turn_index % SUMMARY_REFRESH_EVERY == 0
+    )
+
+
 def _extract_json(raw):
     """Parses a JSON object from a model response, tolerating code fences and any
     reasoning/preamble text some open models (e.g. GPT-OSS) emit before the JSON."""
@@ -596,17 +648,70 @@ def _call_model(client, model, system_prompt, user_prompt):
     return _extract_json(raw), elapsed_s, server_s
 
 
-def analyze_phrase(clients, latest_phrase, full_conversation):
+def analyze_phrase(clients, latest_phrase, full_conversation, previous_summary="", turn_index=None):
     """Detects the intent of the latest phrase and summarizes the conversation so far.
 
     When intent and summary share the same endpoint and model, a single combined
     call is made. When they differ (different endpoint or model), two separate
     prompts are issued IN PARALLEL, one per service.
 
+    When INCREMENTAL_SUMMARY is True (option B), intent/sentiment still use the full
+    transcript but the summary is built from 'previous_summary' + the latest phrase
+    and is ALWAYS issued as a separate parallel call, regardless of endpoint/model
+    sharing. Callers must feed the returned 'summary' back as 'previous_summary' on
+    the next phrase and pass 'turn_index' (1-based phrase count) so that every
+    SUMMARY_REFRESH_EVERY phrases the summary is regenerated from the whole transcript
+    to counter incremental drift.
+
     Returns a dict with 'intent', 'summary' and 'elapsed_s' (wall-clock time), or
     {'error': ...} on failure."""
     user_prompt = _build_user_prompt(latest_phrase, full_conversation)
     try:
+        if INCREMENTAL_SUMMARY:
+            # Option B: intent/sentiment on the full transcript; summary built
+            # incrementally (previous summary + latest phrase) in parallel, except
+            # every SUMMARY_REFRESH_EVERY phrases where it is regenerated in full.
+            refresh = should_refresh_summary(turn_index)
+            if refresh:
+                summary_system_prompt = SUMMARY_SYSTEM_PROMPT
+                summary_user_prompt = user_prompt
+            else:
+                summary_system_prompt = SUMMARY_INCREMENTAL_SYSTEM_PROMPT
+                summary_user_prompt = _build_summary_user_prompt(latest_phrase, previous_summary)
+            if SHOW_DEBUG:
+                mode = "full refresh" if refresh else "incremental"
+                print(f"[DEBUG] [summary: {mode}] Calling intent model "
+                      f"'{AOAI_INTENT_MODEL}' @ {AOAI_INTENT_ENDPOINT} and summary model "
+                      f"'{AOAI_SUMMARY_MODEL}' @ {AOAI_SUMMARY_ENDPOINT} in parallel")
+            start = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                intent_future = executor.submit(
+                    _call_model, clients["intent"], AOAI_INTENT_MODEL,
+                    INTENT_SYSTEM_PROMPT, user_prompt,
+                )
+                summary_future = executor.submit(
+                    _call_model, clients["summary"], AOAI_SUMMARY_MODEL,
+                    summary_system_prompt, summary_user_prompt,
+                )
+                intent_result, intent_elapsed, intent_server = intent_future.result()
+                summary_result, summary_elapsed, summary_server = summary_future.result()
+            elapsed_s = time.perf_counter() - start
+            if intent_server is not None and summary_server is not None:
+                server_s = max(intent_server, summary_server)
+            else:
+                server_s = None
+            return {
+                "intent": intent_result.get("intent", "unknown"),
+                "sentiment": intent_result.get("sentiment", "unknown"),
+                "summary": summary_result.get("summary", ""),
+                "elapsed_s": elapsed_s,
+                "server_elapsed_s": server_s,
+                "intent_elapsed_s": intent_elapsed,
+                "summary_elapsed_s": summary_elapsed,
+                "intent_server_elapsed_s": intent_server,
+                "summary_server_elapsed_s": summary_server,
+            }
+
         if not USE_SEPARATE_INTENT_SUMMARY:
             # Same endpoint and model: a single combined call.
             if SHOW_DEBUG:

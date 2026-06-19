@@ -63,6 +63,9 @@ def speech_recognize_continuous():
 
     # Accumulates all completed phrases of the conversation
     conversation_phrases = []
+    # Running summary + 1-based phrase count kept across phrases for
+    # INCREMENTAL_SUMMARY / periodic full refresh (ignored otherwise).
+    summary_state = {"previous": "", "turn": 0}
 
     def session_started_cb(evt: speech_sdk.SessionEventArgs):
         print_info(f"[INFO] Session started: {evt.session_id}")
@@ -80,8 +83,13 @@ def speech_recognize_continuous():
                 # Accumulate the phrase and analyze it with the LLM
                 conversation_phrases.append(display_text)
                 full_conversation = " ".join(conversation_phrases)
-                analysis = analyze_phrase(aoai_clients, display_text, full_conversation)
+                summary_state["turn"] += 1
+                analysis = analyze_phrase(
+                    aoai_clients, display_text, full_conversation,
+                    summary_state["previous"], summary_state["turn"]
+                )
                 if analysis and "error" not in analysis:
+                    summary_state["previous"] = analysis.get('summary', summary_state["previous"])
                     print(f"[INTENT] {analysis.get('intent', 'unknown')}")
                     print(f"[SENTIMENT] {analysis.get('sentiment', 'unknown')}")
                     print(f"[SUMMARY] {analysis.get('summary', '')}")
