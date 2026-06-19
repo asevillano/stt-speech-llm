@@ -21,7 +21,6 @@ uploads/
 # Output / logs
 output_*.txt
 *.log
-*.csv
 
 # IDE / OS
 .vscode/
@@ -35,3 +34,4 @@ OLD/
 audio_samples/
 conversation_gen/
 .gitignore
+outputs/

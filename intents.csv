@@ -1,0 +1,10 @@
+intent,description
+greetings,"The speaker greets the other party or exchanges pleasantries (hello, introductions, ""how may I help you"")."
+request_info,"The speaker asks the other party for information or details needed to proceed."
+flight_details,"The speaker provides specific flight information such as airline name, flight number, route or departure date/time."
+complain,"The customer expresses dissatisfaction about the service or experience in general terms (not a specific named cause)."
+delay,"The issue is specifically a delayed, late or rescheduled flight, or its consequences (e.g. a missed meeting)."
+apology,"The speaker apologizes or expresses regret for an inconvenience (typically the agent)."
+refund,"A refund, partial refund or compensation is offered, requested or discussed."
+thanks,"The speaker expresses gratitude or appreciation."
+closing,"The speaker wraps up the conversation (offering further help, saying goodbye, confirming nothing else is needed)."
