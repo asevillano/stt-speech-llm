@@ -41,7 +41,7 @@ from common_functions import (
     warmup_speech_token, ResultsCsvWriter,
 )
 
-# Configuration
+# Configuration 
 AUDIO_FILE = DEFAULT_AUDIO_FILE  # default selection
 
 # Directory used both to list local .wav files and to store uploaded audio
